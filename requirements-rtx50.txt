@@ -1,0 +1,16 @@
+# Install PyTorch/torchvision separately with the CUDA wheel recommended by
+# https://pytorch.org/get-started/locally/ for your driver, for example cu128.
+mmcv==1.7.2
+mmengine
+mamba-ssm
+causal-conv1d
+triton
+timm
+lmdb
+numpy
+opencv-python
+Pillow
+tqdm
+einops
+packaging
+thop

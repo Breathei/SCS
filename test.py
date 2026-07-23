@@ -9,6 +9,7 @@ import torch
 import argparse
 import os
 import cv2
+import util.misc as utils
 from datasets import create_dataset
 from models import build_model
 from main import get_args_parser
@@ -21,13 +22,17 @@ args.dataset_path = '../data/TUT'
 if __name__ == '__main__':
     args.batch_size = 1
     t_all = []
-    device = torch.device(args.device)
+    device = utils.validate_runtime_device(args.device)
+    args.device = device
     test_dl = create_dataset(args)
     load_model_file = "./checkpoints/weights/checkpoint_TUT/checkpoint_TUT.pth"
     data_size = len(test_dl)
     model, criterion = build_model(args)
-    state_dict = torch.load(load_model_file)
-    model.load_state_dict(state_dict["model"])
+    try:
+        state_dict = torch.load(load_model_file, map_location=device, weights_only=False)
+    except TypeError:
+        state_dict = torch.load(load_model_file, map_location=device)
+    model.load_state_dict(state_dict.get("model", state_dict))
     model.to(device)
     print("Load Model Successful!")
     suffix = load_model_file.split('/')[-2]
@@ -37,10 +42,8 @@ if __name__ == '__main__':
     with torch.no_grad():
         model.eval()
         for batch_idx, (data) in enumerate(test_dl):
-            x = data["image"]
-            target = data["label"]
-            if device != 'cpu':
-                x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
+            x = data["image"].to(device)
+            target = data["label"].to(device=device, dtype=torch.int64)
             out = model(x)
 
             target = target[0, 0, ...].cpu().numpy()

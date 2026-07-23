@@ -15,10 +15,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     model.train()
     criterion.train()
 
+    device = torch.device(args.device)
     pbar = tqdm(total=len(data_loader.dataloader), desc=f"Initial Loss Fused: Pending")
     for i, data in enumerate(data_loader):
-        samples = data['image'].to(torch.device(args.device))
-        targets = data['label'].to(torch.device(args.device))
+        samples = data['image'].to(device)
+        targets = data['label'].to(device)
 
         output = model(samples)
         loss_final = criterion(output, targets.float())

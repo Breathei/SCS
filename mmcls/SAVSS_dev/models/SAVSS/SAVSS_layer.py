@@ -10,10 +10,39 @@ import torch
 import torch.nn as nn
 from mmcv.cnn.bricks.transformer import build_dropout
 from mmcv.cnn.utils.weight_init import trunc_normal_
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-from mamba_ssm.ops.triton.layernorm import RMSNorm
 from models.GBC import GBC, BottConv
 from models.PAF import PAF
+
+
+def _mamba_install_message():
+    return (
+        "mamba-ssm CUDA extension is unavailable. Install or rebuild "
+        "mamba-ssm and causal-conv1d for the active PyTorch/CUDA stack. "
+        "For RTX 50-series / Blackwell GPUs, use a recent CUDA 12.8+ "
+        "PyTorch wheel and set TORCH_CUDA_ARCH_LIST=\"12.0\" when "
+        "building from source."
+    )
+
+
+def _load_selective_scan_fn():
+    try:
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    except Exception as exc:
+        raise RuntimeError(_mamba_install_message()) from exc
+    return selective_scan_fn
+
+
+def _build_rms_norm(embed_dims):
+    try:
+        from mamba_ssm.ops.triton.layernorm import RMSNorm
+    except Exception as exc:
+        raise RuntimeError(
+            "mamba-ssm Triton RMSNorm is unavailable. Either install a "
+            "mamba-ssm/Triton build matching the active CUDA stack or set "
+            "use_rms_norm=False in the SAVSS layer config. " +
+            _mamba_install_message()
+        ) from exc
+    return RMSNorm(embed_dims)
 
 class SAVSS_2D(nn.Module):
     def __init__(
@@ -229,6 +258,7 @@ class SAVSS_2D(nn.Module):
         direction_Bs = [dB[None, :, :].expand(batch_size, -1, -1).permute(0, 2, 1).to(dtype=B.dtype) for dB in
                         direction_Bs]
 
+        selective_scan_fn = _load_selective_scan_fn()
         y_scan = [
             selective_scan_fn(
                 x_conv[:, o, :].permute(0, 2, 1).contiguous(),
@@ -265,7 +295,7 @@ class SAVSS_Layer(nn.Module):
         super(SAVSS_Layer, self).__init__()
         mamba_cfg.update({'d_model': embed_dims})
         if use_rms_norm:
-            self.norm = RMSNorm(embed_dims)
+            self.norm = _build_rms_norm(embed_dims)
         else:
             self.norm = nn.LayerNorm(embed_dims)
 

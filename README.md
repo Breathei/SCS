@@ -42,30 +42,86 @@ Pixel-level segmentation of structural cracks across various scenarios remains a
 
 #### Environment Setup
 
-You can create your own conda environment for SCSegamba based on the following command⚙️:
+You can create your own conda environment for SCSegamba based on the following command⚙️.
+
+##### RTX 50-series / Blackwell GPUs
+
+RTX 50-series GPUs require a recent NVIDIA driver and a modern CUDA-enabled PyTorch build. The old CUDA 11.6 environment below is kept only for legacy reproduction and is not recommended for RTX 50-series cards.
+
+```shell
+conda create -n SCSegamba python=3.10 -y
+conda activate SCSegamba
+
+# Install the current PyTorch CUDA wheel recommended by https://pytorch.org/get-started/locally/.
+# For CUDA 12.8 builds, the command is typically:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# Install the remaining runtime dependencies.
+pip install -r requirements-rtx50.txt
+```
+
+If `mamba-ssm` or `causal-conv1d` needs to be built from source on RTX 50-series GPUs, use the active CUDA 12.8+ PyTorch environment and build with Blackwell architecture enabled:
+
+```shell
+export TORCH_CUDA_ARCH_LIST="12.0"
+pip install --no-cache-dir --no-build-isolation mamba-ssm causal-conv1d
+```
+
+##### Legacy CUDA 11.6 environment
+
+Use this only if you need to reproduce the original environment on older GPUs:
 
 ```shell
 conda create -n SCSegamba python=3.10 -y
 conda activate SCSegamba
 pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 -f https://download.pytorch.org/whl/torch_stable.html
-pip install -U openmim
-mim install mmcv-full
-pip install mamba-ssm==1.2.0
-pip install timm lmdb mmengine numpy
+pip install -r requirements-legacy-cu116.txt
 ```
 
 #### Run
 
-You can modify the parameters in the **main.py** file and run it with the following command (The structure of the dataset folder is set to be consistent with the [TUT](https://github.com/Karl1109/TUT)):
+You can modify the parameters in the **main.py** file and run it with the following command (The structure of the dataset folder is set to be consistent with the [TUT](https://github.com/Karl1109/TUT)). Select GPUs with `CUDA_VISIBLE_DEVICES` or `--device` instead of editing the source file:
 
 ``````shell
-python main.py
+CUDA_VISIBLE_DEVICES=0 python main.py --device cuda
+# or run on a specific visible CUDA index:
+python main.py --device cuda:0
 ``````
 
 You can also use checkpoints for inference with the following command:
 
 ```shell
-python test.py
+python test.py --device cuda
+```
+
+#### RTX 50-series verification
+
+After installing the RTX 50-series environment, verify the GPU stack before running a full experiment:
+
+```shell
+nvidia-smi
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("device:", torch.cuda.get_device_name(0))
+    print("capability:", torch.cuda.get_device_capability(0))
+    x = torch.randn(1, device="cuda")
+    print("tensor ok:", x)
+PY
+python - <<'PY'
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+print("mamba selective_scan OK")
+PY
+```
+
+Then run a smoke test with the checkpoint and a one-epoch training pass:
+
+```shell
+python test.py --device cuda
+python main.py --device cuda --epochs 1 --batch_size_train 1 --batch_size_test 1 --num_threads 1
 ```
 
 Use the following commands to calculate metrics (You can find the SCSegamba test results on the TUT dataset in the `./results/results_test/TUT_results/` path and calculate the metrics using the following command.):

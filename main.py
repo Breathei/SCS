@@ -5,7 +5,6 @@ Email: liuhui@ieee.org
 '''
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import argparse
 import datetime
 import random
@@ -97,7 +96,8 @@ def main(args):
     print("args: BCELoss_ratio -> " + str(args.BCELoss_ratio))
     print("args: DiceLoss_ratio -> " + str(args.DiceLoss_ratio))
 
-    device = torch.device(args.device)
+    device = utils.validate_runtime_device(args.device, logger=log_train)
+    args.device = device
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -178,10 +178,8 @@ def main(args):
         with torch.no_grad():
             model.eval()
             for batch_idx, (data) in enumerate(test_dl):
-                x = data["image"]
-                target = data["label"]
-                if device != 'cpu':
-                    x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
+                x = data["image"].to(device)
+                target = data["label"].to(device=device, dtype=torch.int64)
                 out = model(x)
                 loss = criterion(out, target.float())
                 target = target[0, 0, ...].cpu().numpy()

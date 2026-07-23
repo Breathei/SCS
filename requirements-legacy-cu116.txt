@@ -1,0 +1,16 @@
+# Legacy reproduction stack from the original README.
+# Install PyTorch/torchvision first with:
+# pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 -f https://download.pytorch.org/whl/torch_stable.html
+openmim
+mmcv-full
+mamba-ssm==1.2.0
+timm
+lmdb
+mmengine
+numpy
+opencv-python
+Pillow
+tqdm
+einops
+packaging
+thop

@@ -19,6 +19,97 @@ from torch import Tensor
 
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
+
+
+def _parse_cuda_version(cuda_version):
+    if cuda_version is None:
+        return None
+    parts = cuda_version.split('.')
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except (TypeError, ValueError):
+        return None
+    return major, minor
+
+
+def _log_runtime_message(message, logger=None):
+    if logger is not None:
+        logger.info(message)
+    print(message)
+
+
+def validate_runtime_device(device, check_mamba=True, logger=None):
+    """Validate the requested runtime device and return a torch.device.
+
+    RTX 50-series / Blackwell GPUs need a recent CUDA-enabled PyTorch build and
+    matching CUDA extensions. This helper catches the common old-stack failures
+    before the model reaches the first forward pass.
+    """
+    device = torch.device(device)
+    if device.type != 'cuda':
+        _log_runtime_message(f"Using device: {device}", logger)
+        return device
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested, but torch.cuda.is_available() is False. "
+            "Install a CUDA-enabled PyTorch build or run with --device cpu."
+        )
+
+    device_count = torch.cuda.device_count()
+    if device.index is not None and device.index >= device_count:
+        raise RuntimeError(
+            f"CUDA device {device} was requested, but only {device_count} "
+            "CUDA device(s) are visible. Check CUDA_VISIBLE_DEVICES or --device."
+        )
+
+    try:
+        torch.empty(1, device=device)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to allocate a CUDA tensor on {device}. Verify the NVIDIA "
+            "driver and the PyTorch CUDA wheel match this GPU."
+        ) from exc
+
+    name = torch.cuda.get_device_name(device)
+    capability = torch.cuda.get_device_capability(device)
+    cuda_version = torch.version.cuda
+    _log_runtime_message(
+        f"Using CUDA device: {name} (sm_{capability[0]}{capability[1]}), "
+        f"PyTorch {torch.__version__}, CUDA runtime {cuda_version}",
+        logger,
+    )
+
+    if capability >= (12, 0):
+        parsed_cuda = _parse_cuda_version(cuda_version)
+        if cuda_version is None:
+            raise RuntimeError(
+                "RTX 50-series / Blackwell GPU detected, but PyTorch is "
+                "CPU-only. Install a CUDA 12.8+ PyTorch wheel, for example "
+                "the current cu128 command from https://pytorch.org/."
+            )
+        if parsed_cuda is not None and parsed_cuda < (12, 8):
+            raise RuntimeError(
+                "RTX 50-series / Blackwell GPU detected, but this PyTorch "
+                f"build uses CUDA {cuda_version}. Install a CUDA 12.8+ "
+                "PyTorch wheel and rebuild CUDA extensions such as mamba-ssm."
+            )
+
+    if check_mamba:
+        try:
+            from mamba_ssm.ops.selective_scan_interface import selective_scan_fn  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to import mamba-ssm selective_scan_fn. Reinstall or "
+                "rebuild mamba-ssm and causal-conv1d for the active PyTorch/"
+                "CUDA environment. On RTX 50-series, use a recent CUDA 12.8+ "
+                "stack and set TORCH_CUDA_ARCH_LIST=\"12.0\" when building "
+                "from source."
+            ) from exc
+
+    return device
+
 # if float(torchvision.__version__[:3]) < 0.5:
 #     import math
 #     from torchvision.ops.misc import _NewEmptyTensorOp
