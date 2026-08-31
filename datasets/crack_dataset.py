@@ -16,14 +16,32 @@ class CrackDataset(BaseDataset):
             args (Option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions
         """
         BaseDataset.__init__(self, args)
-        self.img_paths = make_dataset(os.path.join(args.dataset_path, '{}_img'.format(args.phase)))
-        self.lab_dir = os.path.join(args.dataset_path, '{}_lab'.format(args.phase))
+        self.phase = args.phase
+        self.img_dir, self.lab_dir = self._resolve_split_dirs(args.dataset_path, args.phase)
+        self.img_paths = make_dataset(self.img_dir)
+        if len(self.img_paths) == 0:
+            raise RuntimeError("Found 0 images in: {}".format(self.img_dir))
         self.img_transforms = transforms.Compose([transforms.ToTensor(),
                                                   transforms.Normalize((0.5, 0.5, 0.5),
                                                                        (0.5, 0.5, 0.5))])
         self.lab_transform = MaskToTensor()
 
-        self.phase = args.phase
+    @staticmethod
+    def _resolve_split_dirs(dataset_path, phase):
+        split_candidates = [
+            (os.path.join(dataset_path, phase, 'images'), os.path.join(dataset_path, phase, 'masks')),
+            (os.path.join(dataset_path, '{}_img'.format(phase)), os.path.join(dataset_path, '{}_lab'.format(phase))),
+        ]
+        for img_dir, lab_dir in split_candidates:
+            if os.path.isdir(img_dir) and os.path.isdir(lab_dir):
+                return img_dir, lab_dir
+        tried = [
+            "{} / {}".format(img_dir, lab_dir)
+            for img_dir, lab_dir in split_candidates
+        ]
+        raise FileNotFoundError(
+            "Could not find split '{}' under '{}'. Tried: {}".format(phase, dataset_path, ', '.join(tried))
+        )
 
     def __getitem__(self, index):
         """
@@ -40,12 +58,16 @@ class CrackDataset(BaseDataset):
         """
         # read a image given a random integer index
         img_path = self.img_paths[index]
-        lab_path = os.path.join(self.lab_dir, os.path.basename(img_path).split('.')[0] + '.png')
+        lab_path = os.path.join(self.lab_dir, os.path.splitext(os.path.basename(img_path))[0] + '.png')
 
         img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError("Could not read image: {}".format(img_path))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         lab = cv2.imread(lab_path, cv2.IMREAD_UNCHANGED)
+        if lab is None:
+            raise FileNotFoundError("Could not read mask: {}".format(lab_path))
 
         if len(lab.shape) == 3:
             lab = cv2.cvtColor(lab, cv2.COLOR_BGR2GRAY)

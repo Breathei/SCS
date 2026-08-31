@@ -39,7 +39,8 @@ class SAVSS(BaseBackbone):
                     'dt_init': "random",
                     'conv_bias': True,
                     'bias': True,
-                    'default_hw_shape': (512 // 8, 512 // 8)
+                    'default_hw_shape': (512 // 8, 512 // 8),
+                    'discretization': 'euler'
                 }
             }
         }
@@ -66,6 +67,7 @@ class SAVSS(BaseBackbone):
                  test_cfg=dict(),
                  convert_syncbn=False,
                  freeze_patch_embed=False,
+                 discretization='euler',
                  **kwargs):
         super(SAVSS, self).__init__(init_cfg)
 
@@ -73,6 +75,7 @@ class SAVSS(BaseBackbone):
         self.img_size = to_2tuple(img_size)
         self.convert_syncbn = convert_syncbn
         self.arch = arch
+        self.discretization = discretization
 
         if self.arch is None:
             self.embed_dims = embed_dims
@@ -136,6 +139,9 @@ class SAVSS(BaseBackbone):
                 "embed_dims": self.embed_dims,
                 "drop_path_rate": dpr[i]
             })
+            # 将 backbone 级别的 discretization 传入每一层的 mamba_cfg。
+            if "mamba_cfg" in _layer_cfg_i:
+                _layer_cfg_i["mamba_cfg"].setdefault("discretization", self.discretization)
             if i in self.layers_with_dwconv:
                 _layer_cfg_i.update({"with_dwconv": True})
             else:

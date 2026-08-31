@@ -17,7 +17,6 @@ from main import get_args_parser
 parser = argparse.ArgumentParser('SCSEGAMBA FOR CRACK', parents=[get_args_parser()])
 args = parser.parse_args()
 args.phase = 'test'
-args.dataset_path = '../data/TUT'
 
 if __name__ == '__main__':
     args.batch_size = 1
@@ -25,7 +24,7 @@ if __name__ == '__main__':
     device = utils.validate_runtime_device(args.device)
     args.device = device
     test_dl = create_dataset(args)
-    load_model_file = "./checkpoints/weights/checkpoint_TUT/checkpoint_TUT.pth"
+    load_model_file = args.checkpoint_path
     data_size = len(test_dl)
     model, criterion = build_model(args)
     try:
@@ -35,7 +34,7 @@ if __name__ == '__main__':
     model.load_state_dict(state_dict.get("model", state_dict))
     model.to(device)
     print("Load Model Successful!")
-    suffix = load_model_file.split('/')[-2]
+    suffix = os.path.splitext(os.path.basename(load_model_file))[0]
     save_root = "./results/results_test/" + suffix
     if not os.path.isdir(save_root):
         os.makedirs(save_root)

@@ -32,7 +32,7 @@ def get_args_parser():
                         help='Weight ratio for Dice Loss (0.0-1.0), should sum to 1 with BCELoss_ratio')
     parser.add_argument('--Norm_Type', default='GN', type=str,
                         help='Normalization layer type [GN|BN], GN=GroupNorm')
-    parser.add_argument('--dataset_path', default="../data/TUT",
+    parser.add_argument('--dataset_path', default="./Dataset/TUT",
                         help='Root directory path for dataset')
     parser.add_argument('--batch_size_train', type=int, default=1,
                         help='Number of samples per training batch (affects memory usage)')
@@ -72,13 +72,24 @@ def get_args_parser():
                         help='Input image width for preprocessing (will be resized)')
     parser.add_argument('--load_height', type=int, default=512,
                         help='Input image height for preprocessing (will be resized)')
+    parser.add_argument('--checkpoint_path', default='./checkpoints/weights/checkpoint_TUT/checkpoint_TUT.pth',
+                        help='Checkpoint path for standalone test.py inference')
+    parser.add_argument('--resume', default='', type=str,
+                        help='Resume training from a saved checkpoint path')
+    parser.add_argument('--discretization', default='euler', type=str,
+                        choices=['euler', 'trapezoidal_fixed'],
+                        help='Selective scan discretization: euler (default) or trapezoidal_fixed')
     return parser
 
 def main(args):
     checkpoints_path = "./checkpoints"
     cur_time = time.strftime('%Y_%m_%d_%H:%M:%S', time.localtime(time.time()))
-    dataset_name = (args.dataset_path).split('/')[-1]
-    process_folder_path = os.path.join(checkpoints_path, cur_time + '_Dataset->' + dataset_name)
+    dataset_name = os.path.basename(os.path.normpath(args.dataset_path))
+    if args.resume:
+        run_name = os.path.basename(os.path.dirname(os.path.normpath(args.resume)))
+    else:
+        run_name = cur_time + '_Dataset->' + dataset_name
+    process_folder_path = os.path.join(checkpoints_path, run_name)
     args.phase = 'train'
     if not os.path.exists(process_folder_path):
         os.makedirs(process_folder_path)
@@ -106,6 +117,26 @@ def main(args):
     model, criterion = build_model(args)
     model.to(device)
     args.batch_size = args.batch_size_train
+
+    start_epoch = args.start_epoch
+    resume_optimizer_state = None
+    resume_scheduler_state = None
+    if args.resume:
+        resume_path = args.resume
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        log_train.info("Resume checkpoint -> " + str(resume_path))
+        print("Resume checkpoint -> " + str(resume_path))
+        try:
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint.get('model', checkpoint))
+        resume_optimizer_state = checkpoint.get('optimizer')
+        resume_scheduler_state = checkpoint.get('lr_scheduler')
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+
     train_dataLoader = create_dataset(args)
     dataset_size = len(train_dataLoader)
     print('The number of training images = %d' % dataset_size)
@@ -132,10 +163,16 @@ def main(args):
     elif args.lr_scheduler == 'CosLR':
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-5)
     elif args.lr_scheduler == 'PolyLR':
-        lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=args.start_epoch, end=args.epochs)
+        lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=start_epoch, end=args.epochs)
     else:
         raise ValueError(f"Unsupported lr_scheduler: {args.lr_scheduler}")
-    output_dir = args.output_dir + '/' + cur_time + '_Dataset->' + dataset_name
+
+    if resume_optimizer_state is not None:
+        optimizer.load_state_dict(resume_optimizer_state)
+    if resume_scheduler_state is not None:
+        lr_scheduler.load_state_dict(resume_scheduler_state)
+
+    output_dir = args.output_dir + '/' + run_name
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     output_dir = Path(output_dir)
 
