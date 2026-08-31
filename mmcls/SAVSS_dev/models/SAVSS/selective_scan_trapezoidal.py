@@ -1,0 +1,180 @@
+'''
+Author: Hui Liu
+Github: https://github.com/Karl1109
+Email: liuhui@ieee.org
+
+Pure-PyTorch reference implementations of selective scan discretizations.
+
+These functions are intended as a correctness reference and as a fallback when
+mamba_ssm's fused kernel is unavailable.  They implement the same tensor layout
+as mamba_ssm.ops.selective_scan_interface.selective_scan_fn:
+
+    u, delta : (B, E, L)
+    A        : (E, N)
+    B, C     : (B, N, L)
+    D        : (E,)
+    delta_bias : (E,)
+
+Two discretizations are provided:
+
+1. exponential-Euler (lam=1.0):
+       h_t = exp(Δ_t A) h_{t-1} + Δ_t B_t x_t
+
+2. Mamba-3 style exponential-trapezoidal (lam=0.5 by default):
+       h_t = exp(Δ_t A) h_{t-1}
+             + (1-λ) Δ_t exp(Δ_t A) B_{t-1} x_{t-1}
+             + λ Δ_t B_t x_t
+
+In both cases the output is:
+       y_t = C_t^T h_t + D x_t
+
+The first step (t=0) has no previous input, so it falls back to the Euler
+term  Δ_0 B_0 x_0  to keep the boundary consistent with the fused kernel.
+'''
+
+import torch
+import torch.nn.functional as F
+
+
+def selective_scan_trapezoidal_fn(
+    u,
+    delta,
+    A,
+    B,
+    C,
+    D=None,
+    z=None,
+    delta_bias=None,
+    delta_softplus=True,
+    return_last_state=False,
+    lam=0.5,
+):
+    """
+    Pure-PyTorch exponential-trapezoidal selective scan.
+
+    Parameters
+    ----------
+    u : torch.Tensor
+        Input sequence, shape (B, E, L).
+    delta : torch.Tensor
+        Raw delta (before bias/softplus), shape (B, E, L).
+    A : torch.Tensor
+        Continuous state matrix (diagonal), shape (E, N).
+    B, C : torch.Tensor
+        Input-dependent weights, shape (B, N, L).
+    D : torch.Tensor, optional
+        Skip connection scale, shape (E,).
+    z : torch.Tensor, optional
+        Kept for signature compatibility with mamba_ssm; gating is done
+        outside this function.
+    delta_bias : torch.Tensor, optional
+        Bias added to delta before softplus, shape (E,).
+    delta_softplus : bool
+        Whether to apply softplus to delta after adding the bias.
+    return_last_state : bool
+        If True, return (y, last_state).
+    lam : float
+        Trapezoidal mixing weight.  lam=1.0 recovers Euler; lam=0.5 gives the
+        standard trapezoidal rule.
+
+    Returns
+    -------
+    y : torch.Tensor
+        Output sequence, shape (B, E, L).
+    last_state : torch.Tensor, optional
+        Final hidden state, shape (B, E, N); returned if return_last_state=True.
+    """
+    if z is not None:
+        # This function does not apply SiLU gating; that is done in SAVSS_2D.
+        # We accept the argument only to keep the call signature drop-in.
+        pass
+
+    B_batch, E, L = u.shape
+    N = A.shape[1]
+    dtype = u.dtype
+    device = u.device
+
+    # Δ preprocessing: add bias and optional softplus.
+    if delta_bias is not None:
+        delta_processed = delta + delta_bias.view(1, -1, 1)
+    else:
+        delta_processed = delta
+    if delta_softplus:
+        delta_processed = F.softplus(delta_processed)
+
+    # Discretized state decay: (B, E, L, N).
+    # A is negative, delta is positive -> A_bar in (0, 1].
+    A_bar = torch.exp(delta_processed.unsqueeze(-1) * A.view(1, E, 1, N))
+
+    # P_t = B_t * x_t, shape (B, E, L, N).
+    # B is (B, N, L); bring L to the front, unsqueeze E, multiply by u (B, L, E, 1).
+    B_t = B.transpose(1, 2)                       # (B, L, N)
+    u_t = u.transpose(1, 2)                       # (B, L, E)
+    P = u_t.unsqueeze(-1) * B_t.unsqueeze(2)      # (B, L, E, N)
+    P = P.permute(0, 2, 1, 3).contiguous()        # (B, E, L, N)
+
+    # Prepare output.
+    y = torch.empty(B_batch, E, L, dtype=dtype, device=device)
+    h = torch.zeros(B_batch, E, N, dtype=dtype, device=device)
+
+    one_minus_lam = 1.0 - lam
+
+    for t in range(L):
+        d_t = delta_processed[:, :, t].unsqueeze(-1)          # (B, E, 1)
+        P_t = P[:, :, t, :]                         # (B, E, N)
+        A_bar_t = A_bar[:, :, t, :]                 # (B, E, N)
+
+        if t == 0:
+            # No previous input; use a full Euler first step so that lam=1.0
+            # reproduces the standard Euler recurrence exactly.
+            h = d_t * P_t
+        else:
+            P_prev = P[:, :, t - 1, :]              # (B, E, N)
+            h = A_bar_t * h \
+                + one_minus_lam * d_t * A_bar_t * P_prev \
+                + lam * d_t * P_t
+
+        # y_t = C_t^T h_t + D * u_t
+        C_now = C[:, :, t]                          # (B, N)
+        y_t = (h * C_now.unsqueeze(1)).sum(dim=-1)  # (B, E)
+        if D is not None:
+            y_t = y_t + D.view(1, -1) * u[:, :, t]  # (B, E)
+        y[:, :, t] = y_t
+
+    if return_last_state:
+        return y, h
+    return y
+
+
+def selective_scan_euler_pytorch_fn(
+    u,
+    delta,
+    A,
+    B,
+    C,
+    D=None,
+    z=None,
+    delta_bias=None,
+    delta_softplus=True,
+    return_last_state=False,
+):
+    """
+    Pure-PyTorch exponential-Euler selective scan.
+
+    This is exactly the lam=1.0 specialisation of
+    :func:`selective_scan_trapezoidal_fn`, provided as a convenience fallback
+    when mamba_ssm's fused kernel is unavailable.
+    """
+    return selective_scan_trapezoidal_fn(
+        u,
+        delta,
+        A,
+        B,
+        C,
+        D=D,
+        z=z,
+        delta_bias=delta_bias,
+        delta_softplus=delta_softplus,
+        return_last_state=return_last_state,
+        lam=1.0,
+    )
