@@ -3,6 +3,7 @@ Checkpoints_raw/
 Dataset/
 results/
 __pycache__/
+Crack500/
 *.pyc
 *.pdf
 *.xlsx
