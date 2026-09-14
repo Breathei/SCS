@@ -77,8 +77,11 @@ def get_args_parser():
     parser.add_argument('--resume', default='', type=str,
                         help='Resume training from a saved checkpoint path')
     parser.add_argument('--discretization', default='euler', type=str,
-                        choices=['euler', 'trapezoidal_fixed'],
-                        help='Selective scan discretization: euler (default) or trapezoidal_fixed')
+                        choices=['euler', 'trapezoidal_fixed', 'trapezoidal_data'],
+                        help='Selective scan discretization: euler (default), '
+                             'trapezoidal_fixed (lam=0.5) or trapezoidal_data (data-dependent lam)')
+    parser.add_argument('--lam_nheads', default=8, type=int,
+                        help='Number of lam heads for trapezoidal_data (must divide expand*d_model)')
     return parser
 
 def main(args):

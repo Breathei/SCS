@@ -22,14 +22,18 @@ Two discretizations are provided:
 
 2. Mamba-3 style exponential-trapezoidal (lam=0.5 by default):
        h_t = exp(Δ_t A) h_{t-1}
-             + (1-λ) Δ_t exp(Δ_t A) B_{t-1} x_{t-1}
-             + λ Δ_t B_t x_t
+             + (1-λ_t) Δ_t exp(Δ_t A) B_{t-1} x_{t-1}
+             + λ_t Δ_t B_t x_t
 
 In both cases the output is:
        y_t = C_t^T h_t + D x_t
 
 The first step (t=0) has no previous input, so it falls back to the Euler
 term  Δ_0 B_0 x_0  to keep the boundary consistent with the fused kernel.
+
+lam may be a float scalar (fixed) or a tensor of shape (B, L, NH) with one
+data-dependent mixing weight per token per head; channel e uses head
+index e // (E // NH), so E must be divisible by NH.
 '''
 
 import torch
@@ -73,9 +77,12 @@ def selective_scan_trapezoidal_fn(
         Whether to apply softplus to delta after adding the bias.
     return_last_state : bool
         If True, return (y, last_state).
-    lam : float
-        Trapezoidal mixing weight.  lam=1.0 recovers Euler; lam=0.5 gives the
-        standard trapezoidal rule.
+    lam : float or torch.Tensor
+        Trapezoidal mixing weight.  A float scalar gives a fixed weight
+        (lam=1.0 recovers Euler; lam=0.5 gives the standard trapezoidal
+        rule).  A tensor of shape (B, L, NH) gives a data-dependent,
+        per-token weight for each of NH heads; channel e uses head
+        e // (E // NH).
 
     Returns
     -------
@@ -117,12 +124,28 @@ def selective_scan_trapezoidal_fn(
     y = torch.empty(B_batch, E, L, dtype=dtype, device=device)
     h = torch.zeros(B_batch, E, N, dtype=dtype, device=device)
 
-    one_minus_lam = 1.0 - lam
+    # lam: fixed scalar, or (B, L, NH) tensor expanded to (B, E, L) so that
+    # channel e uses head e // (E // NH) (channel-contiguous grouping).
+    lam_is_tensor = torch.is_tensor(lam)
+    if lam_is_tensor:
+        NH = lam.shape[-1]
+        if lam.dim() != 3 or lam.shape[0] != B_batch or lam.shape[1] != L:
+            raise ValueError(
+                f"tensor lam must have shape (B, L, NH)=({B_batch}, {L}, NH), "
+                f"got {tuple(lam.shape)}"
+            )
+        if E % NH != 0:
+            raise ValueError(f"E={E} must be divisible by NH={NH}")
+        lam_full = lam.permute(0, 2, 1).repeat_interleave(E // NH, dim=1)
 
     for t in range(L):
         d_t = delta_processed[:, :, t].unsqueeze(-1)          # (B, E, 1)
         P_t = P[:, :, t, :]                         # (B, E, N)
         A_bar_t = A_bar[:, :, t, :]                 # (B, E, N)
+        if lam_is_tensor:
+            lam_t = lam_full[:, :, t].unsqueeze(-1)  # (B, E, 1)
+        else:
+            lam_t = lam
 
         if t == 0:
             # No previous input; use a full Euler first step so that lam=1.0
@@ -131,8 +154,8 @@ def selective_scan_trapezoidal_fn(
         else:
             P_prev = P[:, :, t - 1, :]              # (B, E, N)
             h = A_bar_t * h \
-                + one_minus_lam * d_t * A_bar_t * P_prev \
-                + lam * d_t * P_t
+                + (1.0 - lam_t) * d_t * A_bar_t * P_prev \
+                + lam_t * d_t * P_t
 
         # y_t = C_t^T h_t + D * u_t
         C_now = C[:, :, t]                          # (B, N)

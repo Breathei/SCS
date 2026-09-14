@@ -68,6 +68,7 @@ class SAVSS(BaseBackbone):
                  convert_syncbn=False,
                  freeze_patch_embed=False,
                  discretization='euler',
+                 lam_nheads=8,
                  **kwargs):
         super(SAVSS, self).__init__(init_cfg)
 
@@ -76,6 +77,7 @@ class SAVSS(BaseBackbone):
         self.convert_syncbn = convert_syncbn
         self.arch = arch
         self.discretization = discretization
+        self.lam_nheads = lam_nheads
 
         if self.arch is None:
             self.embed_dims = embed_dims
@@ -139,9 +141,13 @@ class SAVSS(BaseBackbone):
                 "embed_dims": self.embed_dims,
                 "drop_path_rate": dpr[i]
             })
-            # 将 backbone 级别的 discretization 传入每一层的 mamba_cfg。
+            # 将 backbone 级别的 discretization / lam_nheads 传入每一层的 mamba_cfg。
+            # 注意：这里必须用显式赋值覆盖 arch_zoo 中的默认值，
+            # 原先的 setdefault 在 arch='Crack'（arch_zoo 已含 'discretization': 'euler'）
+            # 时是空操作，会导致命令行 --discretization 被静默忽略。
             if "mamba_cfg" in _layer_cfg_i:
-                _layer_cfg_i["mamba_cfg"].setdefault("discretization", self.discretization)
+                _layer_cfg_i["mamba_cfg"]["discretization"] = self.discretization
+                _layer_cfg_i["mamba_cfg"]["lam_nheads"] = self.lam_nheads
             if i in self.layers_with_dwconv:
                 _layer_cfg_i.update({"with_dwconv": True})
             else:

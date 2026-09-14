@@ -16,8 +16,8 @@ Tensor layout is identical to mamba_ssm.ops.selective_scan_interface.selective_s
 Recurrence (exponential-trapezoidal, lam=0.5 by default):
 
     h_t = exp(Δ_t A) h_{t-1}
-          + (1-λ) Δ_t exp(Δ_t A) B_{t-1} x_{t-1}
-          + λ Δ_t B_t x_t
+          + (1-λ_t) Δ_t exp(Δ_t A) B_{t-1} x_{t-1}
+          + λ_t Δ_t B_t x_t
     y_t = C_t^T h_t + D x_t
 
 where Δ_t = softplus(delta_t + delta_bias).
@@ -26,6 +26,12 @@ At t=0 the previous term is missing, so the first step falls back to Euler:
     h_0 = Δ_0 B_0 x_0
 
 This keeps lam=1.0 exactly equivalent to the standard Euler discretization.
+
+lam may be a scalar (fixed, the original validated behavior) or a
+data-dependent tensor of shape (B, L, NH) giving one mixing weight per
+token per head.  Channels are grouped into NH heads channel-contiguously:
+channel e uses head index e // (E // NH), so E must be divisible by NH.
+The scalar path is kept bit-identical to the original implementation.
 '''
 
 import torch
@@ -92,7 +98,13 @@ def _selective_scan_trapezoidal_fwd_kernel(
     h_stride_e,
     h_stride_l,
     h_stride_n,
+    lam_ptr,
+    lam_stride_batch,
+    lam_stride_l,
+    lam_stride_h,
+    NH,
     lam: tl.constexpr,
+    HAS_LAM_TENSOR: tl.constexpr,
     delta_softplus: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -115,7 +127,11 @@ def _selective_scan_trapezoidal_fwd_kernel(
     else:
         delta_bias_e = 0.0
 
-    one_minus_lam = 1.0 - lam
+    # Head index of this channel when lam is a (B, L, NH) tensor.
+    if HAS_LAM_TENSOR:
+        head = e // (E // NH)
+    else:
+        head = 0
 
     # Base pointers for this (b, e).
     u_base = u_ptr + b * u_stride_batch + e * u_stride_e
@@ -124,6 +140,7 @@ def _selective_scan_trapezoidal_fwd_kernel(
     C_base = C_ptr + b * C_stride_batch
     y_base = y_ptr + b * y_stride_batch + e * y_stride_e
     h_base = h_ptr + b * h_stride_batch + e * h_stride_e
+    lam_base = lam_ptr + b * lam_stride_batch + head * lam_stride_h
 
     h = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
@@ -141,6 +158,12 @@ def _selective_scan_trapezoidal_fwd_kernel(
         C_t = tl.load(C_base + n_offs * C_stride_n + t * C_stride_l,
                       mask=mask_n, other=0.0).to(tl.float32)
 
+        # Mixing weight: per-token tensor or fixed scalar.
+        if HAS_LAM_TENSOR:
+            lam_t = tl.load(lam_base + t * lam_stride_l).to(tl.float32)
+        else:
+            lam_t = lam
+
         P_t = u_t * B_t
 
         if t == 0:
@@ -151,7 +174,7 @@ def _selective_scan_trapezoidal_fwd_kernel(
                             mask=mask_n, other=0.0).to(tl.float32)
             P_prev = u_prev * B_prev
             A_bar = tl.exp(dt * A_e)
-            h = A_bar * h + one_minus_lam * dt * A_bar * P_prev + lam * dt * P_t
+            h = A_bar * h + (1.0 - lam_t) * dt * A_bar * P_prev + lam_t * dt * P_t
 
         # Save hidden state for backward.
         tl.store(h_base + t * h_stride_l + n_offs * h_stride_n,
@@ -229,7 +252,17 @@ def _selective_scan_trapezoidal_bwd_kernel(
     dC_stride_batch,
     dC_stride_n,
     dC_stride_l,
+    lam_ptr,
+    lam_stride_batch,
+    lam_stride_l,
+    lam_stride_h,
+    dlam_ptr,
+    dlam_stride_batch,
+    dlam_stride_l,
+    dlam_stride_h,
+    NH,
     lam: tl.constexpr,
+    HAS_LAM_TENSOR: tl.constexpr,
     delta_softplus: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -251,7 +284,11 @@ def _selective_scan_trapezoidal_bwd_kernel(
     else:
         delta_bias_e = 0.0
 
-    one_minus_lam = 1.0 - lam
+    # Head index of this channel when lam is a (B, L, NH) tensor.
+    if HAS_LAM_TENSOR:
+        head = e // (E // NH)
+    else:
+        head = 0
 
     u_base = u_ptr + b * u_stride_batch + e * u_stride_e
     delta_base = delta_ptr + b * delta_stride_batch + e * delta_stride_e
@@ -263,6 +300,8 @@ def _selective_scan_trapezoidal_bwd_kernel(
     ddelta_base = ddelta_ptr + b * ddelta_stride_batch + e * ddelta_stride_e
     dB_base = dB_ptr + b * dB_stride_batch
     dC_base = dC_ptr + b * dC_stride_batch
+    lam_base = lam_ptr + b * lam_stride_batch + head * lam_stride_h
+    dlam_base = dlam_ptr + b * dlam_stride_batch + head * dlam_stride_h
     ddelta_bias_per_block_base = ddelta_bias_per_block_ptr + b * ddelta_bias_per_block_stride_batch + e * ddelta_bias_per_block_stride_e
     dA_per_block_base = dA_per_block_ptr + b * dA_per_block_stride_batch + e * dA_per_block_stride_e
     dD_per_block_base = dD_per_block_ptr + b * dD_per_block_stride_batch + e * dD_per_block_stride_e
@@ -275,9 +314,11 @@ def _selective_scan_trapezoidal_bwd_kernel(
     dD = 0.0
     ddelta_bias = 0.0
 
-    # a_prev/dt_prev correspond to a_{t+1}/dt_{t+1} for the current t.
+    # a_prev/dt_prev/lam_prev correspond to a_{t+1}/dt_{t+1}/lam_{t+1}
+    # for the current t.
     a_prev = tl.zeros((BLOCK_N,), dtype=tl.float32)
     dt_prev = 0.0
+    lam_prev = 0.0
 
     for t in range(L - 1, -1, -1):
         u_t = tl.load(u_base + t * u_stride_l).to(tl.float32)
@@ -298,6 +339,12 @@ def _selective_scan_trapezoidal_bwd_kernel(
         h_t = tl.load(h_base + t * h_stride_l + n_offs * h_stride_n,
                       mask=mask_n, other=0.0).to(tl.float32)
 
+        # Mixing weight: per-token tensor or fixed scalar.
+        if HAS_LAM_TENSOR:
+            lam_t = tl.load(lam_base + t * lam_stride_l).to(tl.float32)
+        else:
+            lam_t = lam
+
         P_t = u_t * B_t
         A_bar = tl.exp(dt * A_e)
 
@@ -315,18 +362,22 @@ def _selective_scan_trapezoidal_bwd_kernel(
             du_t = D_e * dout_t + dt * tl.sum(B_t * adj_t)
             dB_t = dt * u_t * adj_t
         else:
-            du_t = D_e * dout_t + lam * dt * tl.sum(B_t * adj_t)
-            dB_t = lam * dt * u_t * adj_t
+            du_t = D_e * dout_t + lam_t * dt * tl.sum(B_t * adj_t)
+            dB_t = lam_t * dt * u_t * adj_t
         if t < L - 1:
-            du_t += one_minus_lam * dt_prev * tl.sum(B_t * a_prev * dh)
-            dB_t += one_minus_lam * dt_prev * u_t * a_prev * dh
+            du_t += (1.0 - lam_prev) * dt_prev * tl.sum(B_t * a_prev * dh)
+            dB_t += (1.0 - lam_prev) * dt_prev * u_t * a_prev * dh
 
         # Gradient w.r.t. C_t.
         dC_t = dout_t * h_t
 
         # Gradient w.r.t. A_e and delta_t (direct effects on h_t only).
+        # lam_t only appears in h_t via
+        # h_t ⊃ (1-lam_t) dt A_bar P_{t-1} + lam_t dt P_t, so
+        # dh_t/dlam_t = dt (P_t - A_bar P_{t-1});  lam_0 is unused.
         if t == 0:
             ddelta_t = dt_prime * tl.sum(adj_t * P_t)
+            dlam_t = 0.0
         else:
             h_prev = tl.load(h_base + (t - 1) * h_stride_l + n_offs * h_stride_n,
                             mask=mask_n, other=0.0).to(tl.float32)
@@ -336,13 +387,18 @@ def _selective_scan_trapezoidal_bwd_kernel(
             P_prev = u_prev * B_prev
 
             # dA contribution at step t.
-            dA += adj_t * A_bar * (h_prev + one_minus_lam * dt * P_prev) * dt
+            dA += adj_t * A_bar * (h_prev + (1.0 - lam_t) * dt * P_prev) * dt
 
             # ddelta_t.
-            term = A_bar * A_e * (h_prev + one_minus_lam * dt * P_prev) \
-                + one_minus_lam * A_bar * P_prev \
-                + lam * P_t
+            term = A_bar * A_e * (h_prev + (1.0 - lam_t) * dt * P_prev) \
+                + (1.0 - lam_t) * A_bar * P_prev \
+                + lam_t * P_t
             ddelta_t = dt_prime * tl.sum(adj_t * term)
+
+            dlam_t = dt * tl.sum(adj_t * (P_t - A_bar * P_prev))
+
+        if HAS_LAM_TENSOR:
+            tl.atomic_add(dlam_base + t * dlam_stride_l, dlam_t)
 
         # Accumulate dD and ddelta_bias.
         dD += dout_t * u_t
@@ -361,6 +417,7 @@ def _selective_scan_trapezoidal_bwd_kernel(
         dh = adj_t
         a_prev = A_bar
         dt_prev = dt
+        lam_prev = lam_t
 
     # Store per-channel accumulated gradients.
     tl.store(dA_per_block_base + n_offs * dA_per_block_stride_n,
@@ -381,6 +438,27 @@ class SelectiveScanTrapezoidalTriton(torch.autograd.Function):
         N = A.shape[1]
         device = u.device
         dtype = u.dtype
+
+        # lam: fixed scalar (original path) or data-dependent (B, L, NH) tensor.
+        lam_is_tensor = torch.is_tensor(lam)
+        if lam_is_tensor:
+            if lam.dim() != 3 or lam.shape[0] != B_batch or lam.shape[1] != L:
+                raise ValueError(
+                    f"tensor lam must have shape (B, L, NH)=({B_batch}, {L}, NH), "
+                    f"got {tuple(lam.shape)}"
+                )
+            NH = lam.shape[2]
+            if E % NH != 0:
+                raise ValueError(f"E={E} must be divisible by NH={NH}")
+            lam = lam.contiguous().float()
+            lam_scalar = 0.0
+            lam_kernel = lam
+        else:
+            NH = 1
+            lam_scalar = float(lam)
+            lam_kernel = u  # dummy pointer, never dereferenced
+        ctx.lam_is_tensor = lam_is_tensor
+        ctx.NH = NH
 
         # Make sure inputs are contiguous and on CUDA.
         u = u.contiguous()
@@ -415,23 +493,32 @@ class SelectiveScanTrapezoidalTriton(torch.autograd.Function):
             delta_bias_kernel.stride(0),
             y.stride(0), y.stride(1), y.stride(2),
             h.stride(0), h.stride(1), h.stride(2), h.stride(3),
-            lam=lam,
+            lam_kernel,
+            lam_kernel.stride(0) if lam_is_tensor else 0,
+            lam_kernel.stride(1) if lam_is_tensor else 0,
+            lam_kernel.stride(2) if lam_is_tensor else 0,
+            NH,
+            lam=lam_scalar,
+            HAS_LAM_TENSOR=lam_is_tensor,
             delta_softplus=delta_softplus,
             BLOCK_N=BLOCK_N,
         )
 
         ctx.delta_softplus = delta_softplus
-        ctx.lam = lam
-        ctx.save_for_backward(u, delta, A, B, C, D, delta_bias, h)
+        ctx.lam_scalar = lam_scalar
+        ctx.save_for_backward(u, delta, A, B, C, D, delta_bias, h,
+                              lam if lam_is_tensor else None)
         return y
 
     @staticmethod
     def backward(ctx, dout):
-        u, delta, A, B, C, D, delta_bias, h = ctx.saved_tensors
+        u, delta, A, B, C, D, delta_bias, h, lam = ctx.saved_tensors
         B_batch, E, L = u.shape
         N = A.shape[1]
         device = u.device
         dtype = u.dtype
+        lam_is_tensor = ctx.lam_is_tensor
+        NH = ctx.NH
 
         dout = dout.contiguous()
 
@@ -442,6 +529,15 @@ class SelectiveScanTrapezoidalTriton(torch.autograd.Function):
         dC = torch.zeros_like(C)
         dD_per_block = torch.empty(B_batch, E, dtype=torch.float32, device=device)
         ddelta_bias_per_block = torch.empty(B_batch, E, dtype=torch.float32, device=device)
+
+        if lam_is_tensor:
+            dlam = torch.zeros_like(lam)
+            lam_kernel = lam
+            dlam_kernel = dlam
+        else:
+            dlam = None
+            lam_kernel = u      # dummy, never dereferenced
+            dlam_kernel = dout  # dummy, never dereferenced
 
         grid = (B_batch * E,)
         BLOCK_N = triton.next_power_of_2(N)
@@ -469,7 +565,17 @@ class SelectiveScanTrapezoidalTriton(torch.autograd.Function):
             ddelta.stride(0), ddelta.stride(1), ddelta.stride(2),
             dB.stride(0), dB.stride(1), dB.stride(2),
             dC.stride(0), dC.stride(1), dC.stride(2),
-            lam=ctx.lam,
+            lam_kernel,
+            lam_kernel.stride(0) if lam_is_tensor else 0,
+            lam_kernel.stride(1) if lam_is_tensor else 0,
+            lam_kernel.stride(2) if lam_is_tensor else 0,
+            dlam_kernel,
+            dlam_kernel.stride(0) if lam_is_tensor else 0,
+            dlam_kernel.stride(1) if lam_is_tensor else 0,
+            dlam_kernel.stride(2) if lam_is_tensor else 0,
+            NH,
+            lam=ctx.lam_scalar,
+            HAS_LAM_TENSOR=lam_is_tensor,
             delta_softplus=ctx.delta_softplus,
             BLOCK_N=BLOCK_N,
         )
@@ -486,10 +592,12 @@ class SelectiveScanTrapezoidalTriton(torch.autograd.Function):
 
         dA = dA.to(A.dtype)
         ddelta_bias = ddelta_bias.to(delta_bias.dtype) if delta_bias is not None else None
+        if dlam is not None:
+            dlam = dlam.to(lam.dtype)
 
         # Gradients for arguments:
         # u, delta, A, B, C, D, delta_bias, delta_softplus, lam
-        return (du, ddelta, dA, dB, dC, dD, ddelta_bias, None, None)
+        return (du, ddelta, dA, dB, dC, dD, ddelta_bias, None, dlam)
 
 
 # --------------------------------------------------------------------------- #
@@ -512,7 +620,10 @@ def selective_scan_trapezoidal_triton_fn(
     Fused Triton implementation of exponential-trapezoidal selective scan.
 
     Parameters match `selective_scan_trapezoidal_fn` exactly so it can be used
-    as a drop-in replacement inside SAVSS_2D.
+    as a drop-in replacement inside SAVSS_2D.  `lam` is either a float scalar
+    (fixed mixing weight, the original validated path) or a tensor of shape
+    (B, L, NH) with one data-dependent mixing weight per token per head;
+    channel e uses head e // (E // NH).
     """
     if z is not None:
         # Gating is handled outside this function, but accept the argument

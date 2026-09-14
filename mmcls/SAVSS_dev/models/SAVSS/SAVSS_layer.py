@@ -66,6 +66,7 @@ class SAVSS_2D(nn.Module):
             init_layer_scale=None,
             default_hw_shape=None,
             discretization="euler",
+            lam_nheads=8,
     ):
         super().__init__()
         # 保存状态空间模型超参数。
@@ -84,8 +85,20 @@ class SAVSS_2D(nn.Module):
         self.n_directions = 4
 
         self.discretization = discretization
-        assert self.discretization in ("euler", "trapezoidal_fixed"), \
+        assert self.discretization in ("euler", "trapezoidal_fixed", "trapezoidal_data"), \
             f"Unsupported discretization: {self.discretization}"
+
+        # 数据依赖的梯形混合权重 lam：
+        # lam = sigmoid(lam_proj(x))，逐 token、逐 head，形状 (B, L, lam_nheads)。
+        # 权重与偏置均零初始化 → 初始 lam ≡ sigmoid(0) = 0.5，
+        # 训练起点与已验证的固定 lam=0.5 版本完全一致（梯度仍可使权重离开 0）。
+        self.lam_nheads = lam_nheads
+        if self.discretization == "trapezoidal_data":
+            assert self.d_inner % lam_nheads == 0, \
+                f"d_inner={self.d_inner} must be divisible by lam_nheads={lam_nheads}"
+            self.lam_proj = nn.Linear(d_model, lam_nheads, bias=True)
+            nn.init.zeros_(self.lam_proj.weight)
+            nn.init.zeros_(self.lam_proj.bias)
 
         # Layer Scale 可学习系数，用于训练初期的稳定。
         self.init_layer_scale = init_layer_scale
@@ -148,7 +161,7 @@ class SAVSS_2D(nn.Module):
 
     def _get_scan_fn(self):
         """根据 discretization 选择 scan 函数。"""
-        if self.discretization == "trapezoidal_fixed":
+        if self.discretization in ("trapezoidal_fixed", "trapezoidal_data"):
             # 优先使用 Triton kernel；编译失败时回退到纯 PyTorch。
             try:
                 from .selective_scan_trapezoidal_triton import selective_scan_trapezoidal_triton_fn
@@ -287,6 +300,13 @@ class SAVSS_2D(nn.Module):
 
         # conv_state / ssm_state 为 Mamba 状态保留位，当前版本未使用 last_state。
         conv_state, ssm_state = None, None
+        # 0) 数据依赖 lam：对原始输入逐 token 计算，形状 (B, L, lam_nheads)。
+        #    在 in_proj 之前从 x 计算，与固定 lam 路径互斥。
+        lam = None
+        if self.discretization == "trapezoidal_data":
+            lam = torch.sigmoid(self.lam_proj(x))
+            #  detach 副本供训练监控（lam 分布/随训练变化的检查）。
+            self.last_lam = lam.detach()
         # 1) 输入投影：x 被切成两段，分别作为主干 x 和门控 z。
         xz = self.in_proj(x)
         # 2) 状态矩阵 A：参数化存储为 log，前向时取负指数。
@@ -316,26 +336,30 @@ class SAVSS_2D(nn.Module):
 
         # 6) 对 4 个方向分别调用 selective_scan_fn：
         #    先按 order 重排 x → scan → 按 inv_order 逆序恢复 → 得到该方向的全局响应。
+        #    数据依赖 lam 时，lam 与 x 一样按各方向的 order 重排后传入。
         scan_fn = self._get_scan_fn()
-        scan_kwargs = {}
-        if self.discretization == "trapezoidal_fixed":
-            scan_kwargs["lam"] = 0.5
-        y_scan = [
-            scan_fn(
-                x_conv[:, o, :].permute(0, 2, 1).contiguous(),
-                dt,
-                A,
-                (B + dB).contiguous(),
-                C,
-                self.D.float(),
-                z=None,
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-                return_last_state=ssm_state is not None,
-                **scan_kwargs,
-            ).permute(0, 2, 1)[:, inv_order, :]
-            for o, inv_order, dB in zip(orders, inverse_orders, direction_Bs)
-        ]
+        y_scan = []
+        for o, inv_order, dB in zip(orders, inverse_orders, direction_Bs):
+            scan_kwargs = {}
+            if self.discretization == "trapezoidal_fixed":
+                scan_kwargs["lam"] = 0.5
+            elif self.discretization == "trapezoidal_data":
+                scan_kwargs["lam"] = lam[:, o, :].contiguous()
+            y_scan.append(
+                scan_fn(
+                    x_conv[:, o, :].permute(0, 2, 1).contiguous(),
+                    dt,
+                    A,
+                    (B + dB).contiguous(),
+                    C,
+                    self.D.float(),
+                    z=None,
+                    delta_bias=self.dt_proj.bias.float(),
+                    delta_softplus=True,
+                    return_last_state=ssm_state is not None,
+                    **scan_kwargs,
+                ).permute(0, 2, 1)[:, inv_order, :]
+            )
 
         # 7) 4 向扫描结果相加，并用 SiLU 门控 z 进行调制，最后投影回 d_model。
         y = sum(y_scan) * self.act(z)
