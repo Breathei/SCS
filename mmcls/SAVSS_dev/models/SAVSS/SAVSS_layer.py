@@ -67,6 +67,9 @@ class SAVSS_2D(nn.Module):
             default_hw_shape=None,
             discretization="euler",
             lam_nheads=8,
+            trap_lambda=0.5,
+            trap_boundary="euler",
+            trap_lambda_per_dir=False,
     ):
         super().__init__()
         # 保存状态空间模型超参数。
@@ -85,8 +88,9 @@ class SAVSS_2D(nn.Module):
         self.n_directions = 4
 
         self.discretization = discretization
-        assert self.discretization in ("euler", "trapezoidal_fixed", "trapezoidal_data"), \
-            f"Unsupported discretization: {self.discretization}"
+        assert self.discretization in (
+            "euler", "trapezoid", "trapezoidal_fixed", "trapezoidal_data", "gated_trapezoid"
+        ), f"Unsupported discretization: {self.discretization}"
 
         # 数据依赖的梯形混合权重 lam：
         # lam = sigmoid(lam_proj(x))，逐 token、逐 head，形状 (B, L, lam_nheads)。
@@ -99,6 +103,33 @@ class SAVSS_2D(nn.Module):
             self.lam_proj = nn.Linear(d_model, lam_nheads, bias=True)
             nn.init.zeros_(self.lam_proj.weight)
             nn.init.zeros_(self.lam_proj.bias)
+
+        # Gated trapezoid 配置。
+        self.trap_lambda = float(trap_lambda)
+        self.trap_boundary = trap_boundary
+        self.trap_lambda_per_dir = trap_lambda_per_dir
+        assert self.trap_boundary in ("euler", "zero_prev"), \
+            f"Unsupported trap_boundary: {self.trap_boundary}"
+        if self.discretization == "gated_trapezoid":
+            # gate g 已移除：数学上 g 与 λ 冗余，固定 g=1 即退化为单参数梯形。
+            lam_init = float(trap_lambda)
+            eps = 1e-6
+            lam_init = max(eps, min(1.0 - eps, lam_init))
+            lam_logit = math.log(lam_init / (1.0 - lam_init))
+            if self.trap_lambda_per_dir:
+                # 4 条扫描方向各自学习一个 λ。
+                # 索引顺序与 sass() 返回的 4 个方向一致：
+                #   0 = 横向蛇形，1 = 纵向蛇形，2 = 主对角蛇形，3 = 副对角蛇形。
+                self.trap_lambda_logit = nn.Parameter(
+                    torch.full((4,), lam_logit, dtype=torch.float32)
+                )
+                self.last_lam_per_dir = None
+            else:
+                # 标量可学习 λ（梯形混合权重），用 sigmoid 约束在 (0,1)。
+                self.trap_lambda_logit = nn.Parameter(
+                    torch.tensor(lam_logit, dtype=torch.float32)
+                )
+                self.last_trap_lambda = None
 
         # Layer Scale 可学习系数，用于训练初期的稳定。
         self.init_layer_scale = init_layer_scale
@@ -161,7 +192,9 @@ class SAVSS_2D(nn.Module):
 
     def _get_scan_fn(self):
         """根据 discretization 选择 scan 函数。"""
-        if self.discretization in ("trapezoidal_fixed", "trapezoidal_data"):
+        if self.discretization in (
+            "trapezoid", "trapezoidal_fixed", "trapezoidal_data", "gated_trapezoid"
+        ):
             # 优先使用 Triton kernel；编译失败时回退到纯 PyTorch。
             try:
                 from .selective_scan_trapezoidal_triton import selective_scan_trapezoidal_triton_fn
@@ -300,13 +333,24 @@ class SAVSS_2D(nn.Module):
 
         # conv_state / ssm_state 为 Mamba 状态保留位，当前版本未使用 last_state。
         conv_state, ssm_state = None, None
-        # 0) 数据依赖 lam：对原始输入逐 token 计算，形状 (B, L, lam_nheads)。
+        # 0) 数据依赖 lam / gated trapezoid 可学习 λ：
         #    在 in_proj 之前从 x 计算，与固定 lam 路径互斥。
         lam = None
         if self.discretization == "trapezoidal_data":
             lam = torch.sigmoid(self.lam_proj(x))
-            #  detach 副本供训练监控（lam 分布/随训练变化的检查）。
+            # detach 副本供训练监控（lam 分布/随训练变化的检查）。
             self.last_lam = lam.detach()
+
+        lam_per_dir = None
+        if self.discretization == "gated_trapezoid":
+            # 仅保留可学习 λ；gate 固定为 1.0（与 λ 冗余，退化为单参数梯形）。
+            if self.trap_lambda_per_dir:
+                # 每条扫描方向一个 λ，形状 (4,)。
+                lam_per_dir = torch.sigmoid(self.trap_lambda_logit)
+                self.last_lam_per_dir = lam_per_dir.detach().clone()
+            else:
+                lam = torch.sigmoid(self.trap_lambda_logit)
+                self.last_trap_lambda = lam.detach().clone()
         # 1) 输入投影：x 被切成两段，分别作为主干 x 和门控 z。
         xz = self.in_proj(x)
         # 2) 状态矩阵 A：参数化存储为 log，前向时取负指数。
@@ -339,12 +383,25 @@ class SAVSS_2D(nn.Module):
         #    数据依赖 lam 时，lam 与 x 一样按各方向的 order 重排后传入。
         scan_fn = self._get_scan_fn()
         y_scan = []
-        for o, inv_order, dB in zip(orders, inverse_orders, direction_Bs):
+        for dir_idx, (o, inv_order, dB) in enumerate(
+            zip(orders, inverse_orders, direction_Bs)
+        ):
             scan_kwargs = {}
-            if self.discretization == "trapezoidal_fixed":
-                scan_kwargs["lam"] = 0.5
+            if self.discretization in ("trapezoid", "trapezoidal_fixed"):
+                scan_kwargs["lam"] = self.trap_lambda
             elif self.discretization == "trapezoidal_data":
                 scan_kwargs["lam"] = lam[:, o, :].contiguous()
+            elif self.discretization == "gated_trapezoid":
+                # gate 已固定为 1.0，仅 λ 可学习。
+                if self.trap_lambda_per_dir:
+                    scan_kwargs["lam"] = lam_per_dir[dir_idx]
+                else:
+                    scan_kwargs["lam"] = lam
+                scan_kwargs["gate"] = torch.tensor(
+                    1.0, device=x.device, dtype=torch.float32
+                )
+                scan_kwargs["boundary"] = self.trap_boundary
+                scan_kwargs["gated"] = True
             y_scan.append(
                 scan_fn(
                     x_conv[:, o, :].permute(0, 2, 1).contiguous(),

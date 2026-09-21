@@ -77,11 +77,23 @@ def get_args_parser():
     parser.add_argument('--resume', default='', type=str,
                         help='Resume training from a saved checkpoint path')
     parser.add_argument('--discretization', default='euler', type=str,
-                        choices=['euler', 'trapezoidal_fixed', 'trapezoidal_data'],
+                        choices=['euler', 'trapezoid', 'trapezoidal_fixed', 'trapezoidal_data', 'gated_trapezoid'],
                         help='Selective scan discretization: euler (default), '
-                             'trapezoidal_fixed (lam=0.5) or trapezoidal_data (data-dependent lam)')
+                             'trapezoid / trapezoidal_fixed (fixed lam=0.5), '
+                             'trapezoidal_data (data-dependent lam), '
+                             'gated_trapezoid (trainable scalar lambda, Triton fused)')
     parser.add_argument('--lam_nheads', default=8, type=int,
                         help='Number of lam heads for trapezoidal_data (must divide expand*d_model)')
+    parser.add_argument('--trap_lambda', default=0.5, type=float,
+                        help='Fixed lambda for trapezoidal_fixed; initial lambda for '
+                             'gated_trapezoid (per-layer scalar, or per-direction vector '
+                             'when --trap_lambda_per_dir is set)')
+    parser.add_argument('--trap_boundary', default='euler', type=str,
+                        choices=['euler', 'zero_prev'],
+                        help='Boundary condition for the first token in gated_trapezoid')
+    parser.add_argument('--trap_lambda_per_dir', action='store_true',
+                        help='Learn a separate lambda for each of the 4 SASS scan '
+                             'directions in gated_trapezoid (default: one scalar per layer)')
     return parser
 
 def main(args):
@@ -134,7 +146,37 @@ def main(args):
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         except TypeError:
             checkpoint = torch.load(resume_path, map_location=device)
-        model.load_state_dict(checkpoint.get('model', checkpoint))
+        state_dict = checkpoint.get('model', checkpoint)
+        # Backward compatibility: older checkpoints may contain the removed
+        # trap_gate_logit parameter. Strip it before loading.
+        stale_gate_keys = [k for k in state_dict if 'trap_gate_logit' in k]
+        if stale_gate_keys:
+            for k in stale_gate_keys:
+                state_dict.pop(k)
+            log_train.info(
+                "Ignoring stale trap_gate_logit parameters from checkpoint: "
+                + str(stale_gate_keys)
+            )
+            print(
+                "Ignoring stale trap_gate_logit parameters from checkpoint: "
+                + str(stale_gate_keys)
+            )
+        # Explicit shape check for trap_lambda_logit to give a clear error when
+        # switching between scalar and per-direction checkpoints.
+        model_state = model.state_dict()
+        for k in state_dict:
+            if 'trap_lambda_logit' in k and k in model_state:
+                ckpt_shape = tuple(state_dict[k].shape)
+                model_shape = tuple(model_state[k].shape)
+                if ckpt_shape != model_shape:
+                    raise RuntimeError(
+                        f"Checkpoint shape mismatch for {k}: "
+                        f"checkpoint {ckpt_shape} vs model {model_shape}. "
+                        f"This usually happens when resuming a checkpoint saved with "
+                        f"scalar lambda into a model with --trap_lambda_per_dir (or vice versa). "
+                        f"Please ensure --trap_lambda_per_dir matches the checkpoint."
+                    )
+        model.load_state_dict(state_dict, strict=True)
         resume_optimizer_state = checkpoint.get('optimizer')
         resume_scheduler_state = checkpoint.get('lr_scheduler')
         if 'epoch' in checkpoint:
@@ -145,13 +187,22 @@ def main(args):
     print('The number of training images = %d' % dataset_size)
     log_train.info('The number of training images = %d' % dataset_size)
 
-    param_dicts = [
-        {
-            "params":
-                [p for n, p in model.named_parameters()],
-            "lr": args.lr,
-        },
+    # λ 标量参数使用 10 倍学习率，使其在 sigmoid 边界附近也能有效更新。
+    base_params = [
+        p for n, p in model.named_parameters()
+        if 'trap_lambda_logit' not in n
     ]
+    lambda_params = [
+        p for n, p in model.named_parameters()
+        if 'trap_lambda_logit' in n
+    ]
+    param_dicts = [
+        {"params": base_params, "lr": args.lr},
+    ]
+    if lambda_params:
+        param_dicts.append({"params": lambda_params, "lr": args.lr * 1.0})
+        print(f"Using {args.lr * 1.0} learning rate for trap_lambda_logit")
+        log_train.info(f"Using {args.lr * 1.0} learning rate for trap_lambda_logit")
     if args.sgd:
         print('use SGD!')
         optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
@@ -171,9 +222,28 @@ def main(args):
         raise ValueError(f"Unsupported lr_scheduler: {args.lr_scheduler}")
 
     if resume_optimizer_state is not None:
-        optimizer.load_state_dict(resume_optimizer_state)
+        try:
+            optimizer.load_state_dict(resume_optimizer_state)
+        except (ValueError, RuntimeError) as exc:
+            log_train.warning(
+                "Optimizer state could not be loaded (likely due to param-group "
+                f"changes after adding 10x LR for lambda): {exc}. "
+                "Continuing with freshly initialized optimizer state."
+            )
+            print(
+                "WARNING: Optimizer state could not be loaded; using fresh optimizer state."
+            )
     if resume_scheduler_state is not None:
-        lr_scheduler.load_state_dict(resume_scheduler_state)
+        try:
+            lr_scheduler.load_state_dict(resume_scheduler_state)
+        except (ValueError, RuntimeError) as exc:
+            log_train.warning(
+                f"LR scheduler state could not be loaded: {exc}. "
+                "Continuing with freshly initialized scheduler state."
+            )
+            print(
+                "WARNING: LR scheduler state could not be loaded; using fresh scheduler state."
+            )
 
     output_dir = args.output_dir + '/' + run_name
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -191,9 +261,12 @@ def main(args):
         train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log_train)
         lr_scheduler.step()
         if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
+            # Checkpoint filename stem: date + time + dataset_name (without the
+            # legacy "Dataset->" separator that is kept in the run folder name).
+            ckpt_stem = run_name.replace('Dataset->', '')
+            checkpoint_paths = [output_dir / f'{ckpt_stem}.pth']
             if (epoch + 1) % 1 == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch}.pth')
+                checkpoint_paths.append(output_dir / f'{ckpt_stem}_epoch{epoch}.pth')
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
                     'model': model.state_dict(),
@@ -203,6 +276,30 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
         print("training epoch finish -> ", epoch)
+
+        # Log learnable λ statistics for gated_trapezoid layers.
+        if args.discretization == 'gated_trapezoid':
+            lambda_items = [
+                (name, torch.sigmoid(m.trap_lambda_logit))
+                for name, m in model.named_modules()
+                if hasattr(m, 'trap_lambda_logit')
+            ]
+            if lambda_items:
+                lines = [f"Epoch {epoch} gated params (per layer):"]
+                for name, lam_tensor in lambda_items:
+                    if lam_tensor.dim() == 0:
+                        # scalar per-layer λ
+                        lines.append(f"  {name}: lambda={lam_tensor.item():.4f}")
+                    else:
+                        # per-direction λ, shape (4,)
+                        vals = [f"{v:.4f}" for v in lam_tensor.tolist()]
+                        lines.append(
+                            f"  {name}: lambda_dir=[{', '.join(vals)}]"
+                        )
+                msg = "\n".join(lines)
+                log_train.info("\n" + msg)
+                print(msg)
+
         print("---------------------------------------------------------------------------------------")
 
         print("testing epoch start -> ", epoch)
@@ -255,7 +352,8 @@ def main(args):
         if(max_mIoU < metrics['mIoU']):
             max_Metrics = metrics
             max_mIoU = metrics['mIoU']
-            checkpoint_paths = [output_dir / f'checkpoint_best.pth']
+            ckpt_stem = run_name.replace('Dataset->', '')
+            checkpoint_paths = [output_dir / f'{ckpt_stem}_best.pth']
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
                     'model': model.state_dict(),

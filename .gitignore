@@ -7,3 +7,5 @@ Crack500/
 *.pyc
 *.pdf
 *.xlsx
+*.sh
+baseline_logs/

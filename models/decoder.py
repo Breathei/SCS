@@ -54,14 +54,16 @@ def build(args):
     args.device = torch.device(args.device)
 
     discretization = getattr(args, 'discretization', 'euler')
-    lam_nheads = getattr(args, 'lam_nheads', 8)
     backbone = SAVSS(arch='Crack',
                      out_indices=(0, 1, 2, 3),
                      drop_path_rate=0.2,
                      final_norm=True,
                      convert_syncbn=True,
                      discretization=discretization,
-                     lam_nheads=lam_nheads)
+                     lam_nheads=getattr(args, 'lam_nheads', 8),
+                     trap_lambda=getattr(args, 'trap_lambda', 0.5),
+                     trap_boundary=getattr(args, 'trap_boundary', 'euler'),
+                     trap_lambda_per_dir=getattr(args, 'trap_lambda_per_dir', False))
     model = Decoder(backbone, args)
     criterion = bce_dice(args)
     criterion.to(device)
