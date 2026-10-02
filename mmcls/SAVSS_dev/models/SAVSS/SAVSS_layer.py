@@ -15,10 +15,15 @@ import math
 from einops import repeat
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.cnn.bricks.transformer import build_dropout
 from mmcv.cnn.utils.weight_init import trunc_normal_
 from models.GBC import GBC, BottConv
 from models.PAF import PAF
+from mmcls.SAVSS_dev.models.SAVSS.selective_scan_trapezoidal import (
+    _SCAN_DIAG_ENABLED,
+    _compute_scan_diag,
+)
 
 
 def _mamba_install_message():
@@ -49,6 +54,10 @@ def _build_rms_norm(embed_dims):
 # 将 HxW 的图像 token 沿 4 个不同方向展平成一维序列，分别输入 Mamba 的 selective scan，
 # 再把 4 个方向的扫描结果逆序拼回 2D，从而在不破坏空间结构的前提下建模全局关系。
 class SAVSS_2D(nn.Module):
+    # 诊断日志全局开关（由 engine.py 在每 200 个 training step 触发一次）。
+    _diag_active = False
+    _diag_step = -1
+
     def __init__(
             self,
             d_model,
@@ -70,6 +79,7 @@ class SAVSS_2D(nn.Module):
             trap_lambda=0.5,
             trap_boundary="euler",
             trap_lambda_per_dir=False,
+            scan_routing='none',
     ):
         super().__init__()
         # 保存状态空间模型超参数。
@@ -86,6 +96,10 @@ class SAVSS_2D(nn.Module):
         self.default_permute_order_inverse = None
         # 4 个扫描方向：横向蛇形、纵向蛇形、主对角线蛇形、反对角线蛇形。
         self.n_directions = 4
+
+        self.scan_routing = scan_routing
+        assert self.scan_routing in ('none', 'asr'), \
+            f"Unsupported scan_routing: {self.scan_routing}"
 
         self.discretization = discretization
         assert self.discretization in (
@@ -130,6 +144,12 @@ class SAVSS_2D(nn.Module):
                     torch.tensor(lam_logit, dtype=torch.float32)
                 )
                 self.last_trap_lambda = None
+
+        # 自适应扫描路由器（Adaptive Scan Router）。
+        # 只在 asr 模式下实例化；none 模式下与原始代码完全等价。
+        if self.scan_routing == 'asr':
+            self.router = ScanRouter(self.d_model)
+            self.register_buffer('last_route_w', None)
 
         # Layer Scale 可学习系数，用于训练初期的稳定。
         self.init_layer_scale = init_layer_scale
@@ -331,6 +351,9 @@ class SAVSS_2D(nn.Module):
         H, W = hw_shape
         E = self.d_inner
 
+        # 保留 SAVSS_2D 的输入，用于 ASR 路由器（asr 模式下根据原始特征图预测 4 向权重）。
+        x_in = x
+
         # conv_state / ssm_state 为 Mamba 状态保留位，当前版本未使用 last_state。
         conv_state, ssm_state = None, None
         # 0) 数据依赖 lam / gated trapezoid 可学习 λ：
@@ -383,6 +406,7 @@ class SAVSS_2D(nn.Module):
         #    数据依赖 lam 时，lam 与 x 一样按各方向的 order 重排后传入。
         scan_fn = self._get_scan_fn()
         y_scan = []
+        diag_entries = []
         for dir_idx, (o, inv_order, dB) in enumerate(
             zip(orders, inverse_orders, direction_Bs)
         ):
@@ -402,12 +426,15 @@ class SAVSS_2D(nn.Module):
                 )
                 scan_kwargs["boundary"] = self.trap_boundary
                 scan_kwargs["gated"] = True
+
+            u_dir = x_conv[:, o, :].permute(0, 2, 1).contiguous()
+            B_dir = (B + dB).contiguous()
             y_scan.append(
                 scan_fn(
-                    x_conv[:, o, :].permute(0, 2, 1).contiguous(),
+                    u_dir,
                     dt,
                     A,
-                    (B + dB).contiguous(),
+                    B_dir,
                     C,
                     self.D.float(),
                     z=None,
@@ -418,13 +445,86 @@ class SAVSS_2D(nn.Module):
                 ).permute(0, 2, 1)[:, inv_order, :]
             )
 
-        # 7) 4 向扫描结果相加，并用 SiLU 门控 z 进行调制，最后投影回 d_model。
-        y = sum(y_scan) * self.act(z)
+            # 诊断日志：仅在 SCAN_DIAG=1 且当前被触发时计算，不影响前向结果和梯度。
+            if SAVSS_2D._diag_active and self.training:
+                d = _compute_scan_diag(
+                    u_dir, dt, A, B_dir,
+                    D=self.D.float(),
+                    delta_bias=self.dt_proj.bias.float(),
+                    delta_softplus=True,
+                    lam=scan_kwargs.get("lam", 1.0),
+                    gate=scan_kwargs.get("gate", 1.0),
+                    boundary=scan_kwargs.get("boundary", "euler"),
+                )
+                if d is not None:
+                    diag_entries.append(d)
+
+        # 诊断日志：当前层 4 个方向的指标取平均，供 engine.py 写入 scan_diag.jsonl。
+        self._diag_entry = None
+        if SAVSS_2D._diag_active and self.training and diag_entries:
+            self._diag_entry = {
+                "step": int(SAVSS_2D._diag_step),
+                "mean_delta": float(sum(d["mean_delta"] for d in diag_entries) / len(diag_entries)),
+                "euler_norm": float(sum(d["euler_norm"] for d in diag_entries) / len(diag_entries)),
+                "corr_norm": float(sum(d["corr_norm"] for d in diag_entries) / len(diag_entries)),
+                "ratio": float(sum(d["ratio"] for d in diag_entries) / len(diag_entries)),
+                "adj_cosine": float(sum(d["adj_cosine"] for d in diag_entries) / len(diag_entries)),
+                "h_norm": float(sum(d["h_norm"] for d in diag_entries) / len(diag_entries)),
+            }
+
+        # 7) 4 向扫描结果融合，并用 SiLU 门控 z 进行调制，最后投影回 d_model。
+        if self.scan_routing == 'asr':
+            # 路由器根据输入特征图预测 4 向权重：w ∈ (B, 4)。
+            router_input = x_in.reshape(batch_size, H, W, self.d_model) \
+                              .permute(0, 3, 1, 2).contiguous()
+            w = self.router(router_input)              # (B, 4)
+            self._route_w = w                           # 供 balancing loss 使用
+            self.last_route_w = w.detach().clone()      # 供 epoch 日志使用
+
+            # y = 4 * sum_k( w[:,k] * y_scan[k] ) * act(z)
+            # 将 y_scan 从 (B, L, E) 还原为 (B, E, H, W)，w[:,k] 广播为 (B, 1, H, W)。
+            y_2d = sum(
+                w[:, k].view(batch_size, 1, 1, 1) *
+                y_scan[k].reshape(batch_size, H, W, E).permute(0, 3, 1, 2)
+                for k in range(4)
+            )
+            y = (4.0 * y_2d).permute(0, 2, 3, 1).reshape(batch_size, L, E)
+        else:
+            # none 模式：保持原始等权求和，计算路径与参数量完全不变。
+            y = sum(y_scan)
+        y = y * self.act(z)
         out = self.out_proj(y)
         if self.init_layer_scale is not None:
             out = out * self.gamma
 
         return out
+
+
+class ScanRouter(nn.Module):
+    """自适应扫描路由器。
+
+    输入：SAVSS_2D 的输入特征图 x，shape (B, C, H, W)
+    输出：对 4 条扫描路径的 softmax 权重，shape (B, 4)。
+
+    最后一个 Linear 层零初始化，使得初始 logits=0 → softmax 输出精确为 1/4，
+    从而保证 asr 模式初始状态与 none 模式的等权求和逐元素等价。
+    """
+    def __init__(self, channels):
+        super().__init__()
+        hidden = channels // 4
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(channels, hidden)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(hidden, 4)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        b = x.size(0)
+        v = self.gap(x).view(b, -1)                 # (B, C)
+        logits = self.fc2(self.relu(self.fc1(v)))   # (B, 4)
+        return F.softmax(logits, dim=-1)            # (B, 4)
+
 
 # SAVSS_Layer: 完整的一个 SAVSS 层，通常堆叠多次构成 backbone。
 # 包含：归一化 → GBC 卷积 → SAVSS_2D 全局扫描 → PAF 融合 → GroupNorm → DropPath → 残差。

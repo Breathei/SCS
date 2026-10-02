@@ -72,6 +72,7 @@ class SAVSS(BaseBackbone):
                  trap_lambda=0.5,
                  trap_boundary='euler',
                  trap_lambda_per_dir=False,
+                 scan_routing='none',
                  **kwargs):
         super(SAVSS, self).__init__(init_cfg)
 
@@ -84,6 +85,7 @@ class SAVSS(BaseBackbone):
         self.trap_lambda = trap_lambda
         self.trap_boundary = trap_boundary
         self.trap_lambda_per_dir = trap_lambda_per_dir
+        self.scan_routing = scan_routing
 
         if self.arch is None:
             self.embed_dims = embed_dims
@@ -157,6 +159,7 @@ class SAVSS(BaseBackbone):
                 _layer_cfg_i["mamba_cfg"]["trap_lambda"] = self.trap_lambda
                 _layer_cfg_i["mamba_cfg"]["trap_boundary"] = self.trap_boundary
                 _layer_cfg_i["mamba_cfg"]["trap_lambda_per_dir"] = self.trap_lambda_per_dir
+                _layer_cfg_i["mamba_cfg"]["scan_routing"] = self.scan_routing
             if i in self.layers_with_dwconv:
                 _layer_cfg_i.update({"with_dwconv": True})
             else:

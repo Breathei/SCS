@@ -63,7 +63,8 @@ def build(args):
                      lam_nheads=getattr(args, 'lam_nheads', 8),
                      trap_lambda=getattr(args, 'trap_lambda', 0.5),
                      trap_boundary=getattr(args, 'trap_boundary', 'euler'),
-                     trap_lambda_per_dir=getattr(args, 'trap_lambda_per_dir', False))
+                     trap_lambda_per_dir=getattr(args, 'trap_lambda_per_dir', False),
+                     scan_routing=getattr(args, 'scan_routing', 'none'))
     model = Decoder(backbone, args)
     criterion = bce_dice(args)
     criterion.to(device)

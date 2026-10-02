@@ -94,6 +94,12 @@ def get_args_parser():
     parser.add_argument('--trap_lambda_per_dir', action='store_true',
                         help='Learn a separate lambda for each of the 4 SASS scan '
                              'directions in gated_trapezoid (default: one scalar per layer)')
+    parser.add_argument('--scan_routing', default='none', type=str,
+                        choices=['none', 'asr'],
+                        help='Adaptive scan routing: none (default, identical to original '
+                             'code) or asr (per-image weighted fusion of 4 SASS directions)')
+    parser.add_argument('--bal_loss_coef', default=0.01, type=float,
+                        help='Coefficient for the ASR balancing loss (default: 0.01)')
     return parser
 
 def main(args):
@@ -133,6 +139,16 @@ def main(args):
     model.to(device)
     args.batch_size = args.batch_size_train
 
+    # 训练开始第一行打印完整配置（读取自实际生效的 args，禁止硬编码）。
+    config_str = (
+        f"Training config: scan_routing={args.scan_routing}, "
+        f"bal_loss_coef={args.bal_loss_coef}, discretization={args.discretization}, "
+        f"trap_lambda={args.trap_lambda}, batch_size={args.batch_size}, "
+        f"lr={args.lr}, seed={args.seed}"
+    )
+    print(config_str)
+    log_train.info(config_str)
+
     start_epoch = args.start_epoch
     resume_optimizer_state = None
     resume_scheduler_state = None
@@ -160,6 +176,22 @@ def main(args):
             print(
                 "Ignoring stale trap_gate_logit parameters from checkpoint: "
                 + str(stale_gate_keys)
+            )
+        # ASR 监控 buffer last_route_w 初始注册为 None（不计入 state_dict），
+        # 训练中变成张量后会被存进 checkpoint；加载到 None buffer 会报
+        # unexpected key。它只是日志用的 detached 副本，首个 forward 即被
+        # 覆盖，直接剔除。
+        route_w_buf_keys = [k for k in state_dict if k.endswith('last_route_w')]
+        if route_w_buf_keys:
+            for k in route_w_buf_keys:
+                state_dict.pop(k)
+            log_train.info(
+                "Ignoring last_route_w monitoring buffers from checkpoint: "
+                + str(route_w_buf_keys)
+            )
+            print(
+                "Ignoring last_route_w monitoring buffers from checkpoint: "
+                + str(route_w_buf_keys)
             )
         # Explicit shape check for trap_lambda_logit to give a clear error when
         # switching between scalar and per-direction checkpoints.
@@ -255,10 +287,10 @@ def main(args):
     max_mIoU = 0
     max_Metrics = {'epoch': 0, 'mIoU': 0, 'ODS': 0, 'OIS': 0, 'F1': 0, 'Precision': 0, 'Recall': 0}
 
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print("---------------------------------------------------------------------------------------")
         print("training epoch start -> ", epoch)
-        train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log_train)
+        train_info = train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log_train)
         lr_scheduler.step()
         if args.output_dir:
             # Checkpoint filename stem: date + time + dataset_name (without the
@@ -299,6 +331,23 @@ def main(args):
                 msg = "\n".join(lines)
                 log_train.info("\n" + msg)
                 print(msg)
+
+        # Log ASR balancing loss and per-layer 4-way average route weights.
+        avg_bal_loss = train_info.get('bal_loss', 0.0)
+        print(f"Epoch {epoch} L_bal: {avg_bal_loss:.6f}")
+        log_train.info(f"Epoch {epoch} L_bal: {avg_bal_loss:.6f}")
+
+        route_w_avgs = train_info.get('route_w_avgs', {})
+        if route_w_avgs:
+            lines = [f"Epoch {epoch} ASR route weights (per layer):"]
+            for name, vals in route_w_avgs.items():
+                lines.append(
+                    f"{name}: route_w=[{vals[0]:.4f},{vals[1]:.4f},"
+                    f"{vals[2]:.4f},{vals[3]:.4f}]"
+                )
+            msg = "\n".join(lines)
+            print(msg)
+            log_train.info("\n" + msg)
 
         print("---------------------------------------------------------------------------------------")
 
