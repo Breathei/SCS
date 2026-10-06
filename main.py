@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import util.misc as utils
-from engine import train_one_epoch
+from engine import train_one_epoch, ModelEMA
 from models import build_model
 from datasets import create_dataset
 import cv2
@@ -100,6 +100,21 @@ def get_args_parser():
                              'code) or asr (per-image weighted fusion of 4 SASS directions)')
     parser.add_argument('--bal_loss_coef', default=0.01, type=float,
                         help='Coefficient for the ASR balancing loss (default: 0.01)')
+    parser.add_argument('--use_ema', action='store_true',
+                        help='Enable EMA (exponential moving average, decay=0.999 with '
+                             'warmup) of model parameters. EMA weights are only used for '
+                             'eval and are saved alongside raw weights in checkpoints '
+                             '(default: off; old experiments stay reproducible)')
+    parser.add_argument('--boundary_alpha', default=0.0, type=float,
+                        help='Boundary weighting strength for BCE: per-pixel weight '
+                             'w = 1 + alpha * (dist_to_crack_boundary < tau), applied to '
+                             'the BCE term only (e.g. --boundary_alpha 5). alpha=0 '
+                             '(default) disables weighting and reproduces the original '
+                             'loss exactly (old experiments stay reproducible)')
+    parser.add_argument('--boundary_tau', default=3.0, type=float,
+                        help='Distance threshold in pixels for the boundary band '
+                             '(default: 3). Boundary band masks are cached under '
+                             '<dataset_path>/boundary_cache/ keyed by tau and size')
     return parser
 
 def main(args):
@@ -143,8 +158,9 @@ def main(args):
     config_str = (
         f"Training config: scan_routing={args.scan_routing}, "
         f"bal_loss_coef={args.bal_loss_coef}, discretization={args.discretization}, "
-        f"trap_lambda={args.trap_lambda}, batch_size={args.batch_size}, "
-        f"lr={args.lr}, seed={args.seed}"
+        f"trap_lambda={args.trap_lambda}, use_ema={args.use_ema}, "
+        f"boundary_alpha={args.boundary_alpha}, boundary_tau={args.boundary_tau}, "
+        f"batch_size={args.batch_size}, lr={args.lr}, seed={args.seed}"
     )
     print(config_str)
     log_train.info(config_str)
@@ -152,6 +168,7 @@ def main(args):
     start_epoch = args.start_epoch
     resume_optimizer_state = None
     resume_scheduler_state = None
+    resume_ema_state = None
     if args.resume:
         resume_path = args.resume
         if not os.path.isfile(resume_path):
@@ -211,8 +228,22 @@ def main(args):
         model.load_state_dict(state_dict, strict=True)
         resume_optimizer_state = checkpoint.get('optimizer')
         resume_scheduler_state = checkpoint.get('lr_scheduler')
+        resume_ema_state = checkpoint.get('model_ema')
         if 'epoch' in checkpoint:
             start_epoch = checkpoint['epoch'] + 1
+
+    # EMA：训练开始时创建参数 shadow 副本（含 GN 的 weight/bias；GN 无 running
+    # buffer，无需特殊处理）。只在每个 optimizer.step() 之后更新，训练前向/反向
+    # 始终使用原始权重；shadow 仅用于 eval 和 checkpoint 保存。
+    model_ema = None
+    if args.use_ema:
+        model_ema = ModelEMA(model, decay=0.999, warmup_steps=1000)
+        if resume_ema_state is not None:
+            model_ema.load_state_dict(resume_ema_state)
+            log_train.info("EMA state loaded from checkpoint.")
+            print("EMA state loaded from checkpoint.")
+        log_train.info("EMA enabled: decay=0.999, warmup_steps=1000 (eval/save only)")
+        print("EMA enabled: decay=0.999, warmup_steps=1000 (eval/save only)")
 
     train_dataLoader = create_dataset(args)
     dataset_size = len(train_dataLoader)
@@ -287,10 +318,65 @@ def main(args):
     max_mIoU = 0
     max_Metrics = {'epoch': 0, 'mIoU': 0, 'ODS': 0, 'OIS': 0, 'F1': 0, 'Precision': 0, 'Recall': 0}
 
+    def run_evaluation(epoch, save_root, tag=''):
+        """在 test 集上前向一遍（写出 PNG），并用官方阈值扫描计算指标，返回 metrics。
+
+        tag 非空时在日志里标记权重组别（'raw'/'ema'），用于区分两组评估指标；
+        tag='' 时输出与旧版逐字节一致（EMA 关闭时走此路径）。
+        """
+        suffix = f" [{tag}]" if tag else ""
+        args.phase = 'test'
+        args.batch_size = args.batch_size_test
+        test_dl = create_dataset(args)
+        pbar = tqdm(total=len(test_dl), desc=f"Initial Loss: Pending")
+
+        if not os.path.isdir(save_root):
+            os.makedirs(save_root)
+        with torch.no_grad():
+            model.eval()
+            for batch_idx, (data) in enumerate(test_dl):
+                x = data["image"].to(device)
+                target = data["label"].to(device=device, dtype=torch.int64)
+                out = model(x)
+                loss = criterion(out, target.float())
+                target = target[0, 0, ...].cpu().numpy()
+                out = out[0, 0, ...].cpu().numpy()
+                root_name = data["A_paths"][0].split("/")[-1][0:-4]
+
+                target = 255 * (target / np.max(target))
+                out = 255 * (out / np.max(out))
+
+                # out[out >= 0.5] = 255
+                # out[out < 0.5] = 0
+
+                log_test.info('----------------------------------------------------------------------------------------------')
+                log_test.info("loss -> " + str(loss))
+                log_test.info(str(os.path.join(save_root, "{}_lab.png".format(root_name))))
+                log_test.info(str(os.path.join(save_root, "{}_pre.png".format(root_name))))
+                log_test.info('----------------------------------------------------------------------------------------------')
+                cv2.imwrite(os.path.join(save_root, "{}_lab.png".format(root_name)), target)
+                cv2.imwrite(os.path.join(save_root, "{}_pre.png".format(root_name)), out)
+                pbar.set_description(f"Loss: {loss.item():.4f}")
+                pbar.update(1)
+        pbar.close()
+
+        log_test.info("model -> " + str(epoch) + " test finish!" + suffix)
+        log_test.info('----------------------------------------------------------------------------------------------')
+        print(f"testing epoch finish ->  {epoch}{suffix}")
+        print("---------------------------------------------------------------------------------------")
+
+        print(f"evalauting epoch start ->  {epoch}{suffix}")
+        if tag:
+            log_eval.info(f"===== [{tag}] weights eval, epoch {epoch} =====")
+        metrics = eval(log_eval, save_root, epoch)
+        for key, value in metrics.items():
+            print(str(key) + ' -> ' + str(value))
+        return metrics
+
     for epoch in range(start_epoch, args.epochs):
         print("---------------------------------------------------------------------------------------")
         print("training epoch start -> ", epoch)
-        train_info = train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log_train)
+        train_info = train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log_train, ema=model_ema)
         lr_scheduler.step()
         if args.output_dir:
             # Checkpoint filename stem: date + time + dataset_name (without the
@@ -300,13 +386,18 @@ def main(args):
             if (epoch + 1) % 1 == 0:
                 checkpoint_paths.append(output_dir / f'{ckpt_stem}_epoch{epoch}.pth')
             for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
+                save_dict = {
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'args': args,
-                }, checkpoint_path)
+                }
+                # 开 EMA 时 checkpoint 同时保存原始权重（'model'）和 shadow 权重
+                # （'model_ema'）两个 key；不开时不加该 key，保持旧格式。
+                if model_ema is not None:
+                    save_dict['model_ema'] = model_ema.state_dict()
+                utils.save_on_master(save_dict, checkpoint_path)
         print("training epoch finish -> ", epoch)
 
         # Log learnable λ statistics for gated_trapezoid layers.
@@ -354,63 +445,38 @@ def main(args):
         print("testing epoch start -> ", epoch)
         results_path = cur_time + '_Dataset->' + dataset_name
         save_root = f'./results/{results_path}/results_' + str(epoch)
-        args.phase = 'test'
-        args.batch_size = args.batch_size_test
-        test_dl = create_dataset(args)
-        pbar = tqdm(total=len(test_dl), desc=f"Initial Loss: Pending")
-
-        if not os.path.isdir(save_root):
-            os.makedirs(save_root)
-        with torch.no_grad():
-            model.eval()
-            for batch_idx, (data) in enumerate(test_dl):
-                x = data["image"].to(device)
-                target = data["label"].to(device=device, dtype=torch.int64)
-                out = model(x)
-                loss = criterion(out, target.float())
-                target = target[0, 0, ...].cpu().numpy()
-                out = out[0, 0, ...].cpu().numpy()
-                root_name = data["A_paths"][0].split("/")[-1][0:-4]
-
-                target = 255 * (target / np.max(target))
-                out = 255 * (out / np.max(out))
-
-                # out[out >= 0.5] = 255
-                # out[out < 0.5] = 0
-
-                log_test.info('----------------------------------------------------------------------------------------------')
-                log_test.info("loss -> " + str(loss))
-                log_test.info(str(os.path.join(save_root, "{}_lab.png".format(root_name))))
-                log_test.info(str(os.path.join(save_root, "{}_pre.png".format(root_name))))
-                log_test.info('----------------------------------------------------------------------------------------------')
-                cv2.imwrite(os.path.join(save_root, "{}_lab.png".format(root_name)), target)
-                cv2.imwrite(os.path.join(save_root, "{}_pre.png".format(root_name)), out)
-                pbar.set_description(f"Loss: {loss.item():.4f}")
-                pbar.update(1)
-        pbar.close()
-
-        log_test.info("model -> " + str(epoch) + " test finish!")
-        log_test.info('----------------------------------------------------------------------------------------------')
-        print("testing epoch finish -> ", epoch)
-        print("---------------------------------------------------------------------------------------")
-
-        print("evalauting epoch start -> ", epoch)
-        metrics = eval(log_eval, save_root, epoch)
-        for key, value in metrics.items():
-            print(str(key) + ' -> ' + str(value))
+        # 开 EMA 时每个 epoch 评估两组权重：raw（训练权重，路径与旧行为一致）
+        # 和 ema（shadow 权重；评估完立即切回训练权重继续训练）。
+        metrics = run_evaluation(epoch, save_root, tag='raw' if model_ema is not None else '')
+        if model_ema is not None:
+            backup = model_ema.apply_to(model)
+            metrics_ema = run_evaluation(epoch, save_root + '_ema', tag='ema')
+            model_ema.restore(model, backup)
+            ema_summary = (
+                f"epoch {epoch} eval summary -> "
+                f"raw: mIoU={metrics['mIoU']:.4f} ODS={metrics['ODS']:.4f} "
+                f"OIS={metrics['OIS']:.4f} F1={metrics['F1']:.4f} | "
+                f"ema: mIoU={metrics_ema['mIoU']:.4f} ODS={metrics_ema['ODS']:.4f} "
+                f"OIS={metrics_ema['OIS']:.4f} F1={metrics_ema['F1']:.4f}"
+            )
+            print(ema_summary)
+            log_eval.info(ema_summary)
         if(max_mIoU < metrics['mIoU']):
             max_Metrics = metrics
             max_mIoU = metrics['mIoU']
             ckpt_stem = run_name.replace('Dataset->', '')
             checkpoint_paths = [output_dir / f'{ckpt_stem}_best.pth']
             for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
+                save_dict = {
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'args': args,
-                }, checkpoint_path)
+                }
+                if model_ema is not None:
+                    save_dict['model_ema'] = model_ema.state_dict()
+                utils.save_on_master(save_dict, checkpoint_path)
             log_train.info("\nupdate and save best model -> " + str(epoch))
             print("\nupdate and save best model -> ", epoch)
 

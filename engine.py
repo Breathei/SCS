@@ -40,6 +40,63 @@ def compute_balancing_loss(model):
     return 4.0 * (w_bar * f).sum()
 
 
+class ModelEMA:
+    """模型参数的指数滑动平均（EMA）。
+
+    只跟踪 named_parameters（GN 只有 weight/bias 参数、无 running buffer，
+    无需特殊处理）。EMA 不参与训练路径：前向/反向始终使用原始权重，
+    shadow 仅用于 eval 与 checkpoint 保存。
+
+    更新规则：shadow = d * shadow + (1 - d) * param
+    warmup：前 warmup_steps 步使用 d_t = min(decay, (1 + step) / (10 + step))。
+    """
+
+    def __init__(self, model, decay=0.999, warmup_steps=1000):
+        self.decay = decay
+        self.warmup_steps = warmup_steps
+        self.updates = 0
+        self.shadow = {n: p.detach().clone() for n, p in model.named_parameters()}
+
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        if self.updates < self.warmup_steps:
+            d = min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
+        else:
+            d = self.decay
+        for n, p in model.named_parameters():
+            self.shadow[n].mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    def state_dict(self):
+        return {
+            'shadow': {n: t.detach().clone() for n, t in self.shadow.items()},
+            'updates': self.updates,
+        }
+
+    def load_state_dict(self, state):
+        # 兼容纯权重 dict（无 'shadow' 包装）的存档。
+        if 'shadow' in state:
+            self.updates = state.get('updates', 0)
+            state = state['shadow']
+        for n, t in state.items():
+            if n in self.shadow:
+                self.shadow[n].copy_(t)
+
+    @torch.no_grad()
+    def apply_to(self, model):
+        """把 shadow 权重写入 model，返回原始权重备份（eval 完后用 restore 恢复）。"""
+        backup = {}
+        for n, p in model.named_parameters():
+            backup[n] = p.detach().clone()
+            p.copy_(self.shadow[n])
+        return backup
+
+    @torch.no_grad()
+    def restore(self, model, backup):
+        for n, p in model.named_parameters():
+            p.copy_(backup[n])
+
+
 def _write_scan_diag(model):
     """把当前 step 各 SAVSS_2D 层的诊断指标追加写入 scan_diag.jsonl。"""
     from mmcls.SAVSS_dev.models.SAVSS.SAVSS_layer import SAVSS_2D  # 延迟导入，避免循环
@@ -65,7 +122,7 @@ def _write_scan_diag(model):
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                     epoch: int, args = None, logger = None):
+                     epoch: int, args = None, logger = None, ema: 'ModelEMA' = None):
     # 延迟导入（原因见模块顶部注释）；函数被调用时所有模块均已初始化完毕。
     from mmcls.SAVSS_dev.models.SAVSS.SAVSS_layer import SAVSS_2D
     from mmcls.SAVSS_dev.models.SAVSS.selective_scan_trapezoidal import _SCAN_DIAG_ENABLED
@@ -86,6 +143,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     for i, data in enumerate(data_loader):
         samples = data['image'].to(device)
         targets = data['label'].to(device)
+        # 边界加权 BCE 的逐像素权重图；--boundary_alpha=0（默认）时数据集不
+        # 提供该键，weights=None，criterion 走与旧版完全一致的调用。
+        weights = data.get('weight')
+        if weights is not None:
+            weights = weights.to(device)
 
         # 诊断日志：每 200 个 training step 触发一次，默认关闭不影响前向。
         diag_should_run = _SCAN_DIAG_ENABLED and (global_step % 200 == 0)
@@ -96,7 +158,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             SAVSS_2D._diag_active = False
 
         output = model(samples)
-        loss_final = criterion(output, targets.float())
+        loss_final = criterion(output, targets.float(), weight=weights)
 
         if diag_should_run:
             _write_scan_diag(model)
@@ -133,6 +195,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
+        if ema is not None:
+            # EMA 只读参数做滑动平均，不改动模型权重，不影响训练路径。
+            ema.update(model)
         global_step += 1
 
     train_one_epoch._global_step = global_step

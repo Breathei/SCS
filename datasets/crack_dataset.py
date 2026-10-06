@@ -1,5 +1,6 @@
 import os.path
 import cv2
+import numpy as np
 from PIL import Image
 from .base_dataset import BaseDataset
 import torchvision.transforms as transforms
@@ -80,10 +81,48 @@ class CrackDataset(BaseDataset):
 
         _, lab = cv2.threshold(lab, 127, 255, cv2.THRESH_BINARY)
         _, lab = cv2.threshold(lab, 127, 1, cv2.THRESH_BINARY)
+        lab01 = lab  # 0/1 二值 numpy（512x512），供边界距离变换使用
 
         img = self.img_transforms(Image.fromarray(img.copy()))
         lab = self.lab_transform(lab.copy()).unsqueeze(0)
-        return {'image': img, 'label': lab, 'A_paths': img_path, 'B_paths': lab_path}
+        sample = {'image': img, 'label': lab, 'A_paths': img_path, 'B_paths': lab_path}
+        # 边界加权 BCE 的逐像素权重图：w = 1 + α·(dist < τ)。
+        # α=0（默认）时不计算也不附加该键，样本结构与旧版完全一致。
+        band = self._boundary_band(lab01, img_path)
+        if band is not None:
+            alpha = float(getattr(self.args, 'boundary_alpha', 0.0))
+            w = 1.0 + alpha * band.astype(np.float32)
+            sample['weight'] = w[None, ...]          # (1, H, W)，与 label 同形
+        return sample
+
+    def _boundary_band(self, lab01, img_path):
+        """裂缝边界距离带：dist < τ 的前景像素为 1，其余为 0（uint8）。
+
+        对二值前景做距离变换，dist 为每个前景像素到最近背景（即裂缝边界）
+        的 L2 像素距离。结果按 (τ, 尺寸, phase) 离线缓存到
+        <dataset_path>/boundary_cache/ 下，α 在加载时施加，缓存与 α 无关。
+        α=0 时返回 None（不计算、不写缓存）。
+        """
+        alpha = float(getattr(self.args, 'boundary_alpha', 0.0))
+        if alpha == 0.0:
+            return None
+        tau = float(getattr(self.args, 'boundary_tau', 3.0))
+        cache_dir = os.path.join(
+            self.args.dataset_path, 'boundary_cache',
+            'tau{:g}_{}x{}'.format(tau, self.args.load_width, self.args.load_height),
+            self.phase)
+        name = os.path.splitext(os.path.basename(img_path))[0] + '.npy'
+        cache_path = os.path.join(cache_dir, name)
+        if os.path.isfile(cache_path):
+            return np.load(cache_path)
+        dist = cv2.distanceTransform(lab01.astype(np.uint8), cv2.DIST_L2, 3)
+        band = ((dist < tau) & (lab01 > 0)).astype(np.uint8)
+        os.makedirs(cache_dir, exist_ok=True)
+        # 先写临时文件再原子改名，避免多 worker 并发写坏缓存。
+        tmp_path = cache_path + '.tmp.npy'
+        np.save(tmp_path, band)
+        os.replace(tmp_path, cache_path)
+        return band
 
     def __len__(self):
         """Return the total number of images in the dataset."""

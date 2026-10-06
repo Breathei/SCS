@@ -6,6 +6,7 @@ Email: liuhui@ieee.org
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS import SAVSS
 from models.MFS import MFS
 
@@ -44,8 +45,14 @@ class bce_dice(nn.Module):
         self.dice_fn = DiceLoss()
         self.args = args
 
-    def forward(self, y_pred, y_true):
-        bce = self.bce_fn(y_pred, y_true)
+    def forward(self, y_pred, y_true, weight=None):
+        # weight=None（默认，α=0 或旧调用方）时走原 BCE 调用，与旧实现逐位一致；
+        # 传入时仅 BCE 部分逐像素加权（reduction 仍为 mean，除以 numel，
+        # 损失尺度与不加权时相当），Dice 部分不变，比例仍由 args 控制。
+        if weight is not None:
+            bce = F.binary_cross_entropy_with_logits(y_pred, y_true, weight=weight)
+        else:
+            bce = self.bce_fn(y_pred, y_true)
         dice = self.dice_fn(y_pred.sigmoid(), y_true)
         return self.args.BCELoss_ratio * bce + self.args.DiceLoss_ratio * dice
 
