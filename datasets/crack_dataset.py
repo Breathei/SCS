@@ -1,6 +1,7 @@
 import os.path
 import cv2
 import numpy as np
+import albumentations as A
 from PIL import Image
 from .base_dataset import BaseDataset
 import torchvision.transforms as transforms
@@ -26,6 +27,26 @@ class CrackDataset(BaseDataset):
                                                   transforms.Normalize((0.5, 0.5, 0.5),
                                                                        (0.5, 0.5, 0.5))])
         self.lab_transform = MaskToTensor()
+
+        # 强增广管道（仅训练集，--strong_aug 开启时生效）。
+        # 在 resize 到 512 之前对原始分辨率 image/mask 同步变换。
+        self.strong_aug = None
+        if self.phase == 'train' and getattr(self.args, 'strong_aug', False):
+            self.strong_aug = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.2,
+                                   rotate_limit=30, p=0.5),
+                A.RandomBrightnessContrast(p=0.4),
+                A.RandomGamma(p=0.3),
+                A.CLAHE(p=0.2),
+                # 噪声强度：std_range 为相对 [0,1] 量程的标准差范围，
+                # (0.02, 0.08) ≈ 5~20 个灰度级（库默认 0.2~0.44 太强会淹没纹理）。
+                # 想调噪声大小改这里即可。
+                A.GaussNoise(std_range=(0.02, 0.08), p=0.25),
+                A.GaussianBlur(p=0.2),
+            ])
 
     @staticmethod
     def _resolve_split_dirs(dataset_path, phase):
@@ -72,6 +93,13 @@ class CrackDataset(BaseDataset):
 
         if len(lab.shape) == 3:
             lab = cv2.cvtColor(lab, cv2.COLOR_BGR2GRAY)
+
+        # 强增广：在 resize 之前执行，image 和 mask 同步变换。
+        # 仅训练集且 --strong_aug 开启时非 None。
+        if self.strong_aug is not None:
+            transformed = self.strong_aug(image=img, mask=lab)
+            img = transformed['image']
+            lab = transformed['mask']
 
         # adjust the image size
         w, h = self.args.load_width, self.args.load_height

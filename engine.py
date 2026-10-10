@@ -137,6 +137,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     bal_loss_cnt = 0
     route_w_sums = {}
     route_w_counts = {}
+
+    # SkeletonDistanceLoss：--skel_loss_coef>0 时才实例化并参与反传；
+    # coef=0（默认）不创建、不调用，训练路径与现状逐 bit 一致。
+    # 权重图每个 batch 由 GT 即时生成（增广后 GT 每次都不同，禁止缓存），
+    # 内部已 detach，梯度只流向 pred。
+    skel_coef = float(getattr(args, 'skel_loss_coef', 0.0))
+    skel_criterion = None
+    if skel_coef > 0.0:
+        from models.skeleton_loss import SkeletonDistanceLoss
+        skel_criterion = SkeletonDistanceLoss()
     # 全局 training step 计数（跨 epoch 持续累加），供 SCAN_DIAG 触发与记录使用。
     global_step = getattr(train_one_epoch, '_global_step', 0)
 
@@ -183,6 +193,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             total_loss = loss_final
             bal_loss_sum += 0.0
             bal_loss_cnt += 1
+
+        if skel_criterion is not None:
+            total_loss = total_loss + skel_coef * skel_criterion(output, targets)
 
         cur_time = time.strftime('%Y_%m_%d_%H:%M:%S', time.localtime(time.time()))
 

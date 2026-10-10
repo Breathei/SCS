@@ -115,6 +115,22 @@ def get_args_parser():
                         help='Distance threshold in pixels for the boundary band '
                              '(default: 3). Boundary band masks are cached under '
                              '<dataset_path>/boundary_cache/ keyed by tau and size')
+    parser.add_argument('--strong_aug', action='store_true',
+                        help='Enable strong albumentations augmentation pipeline on the '
+                             'training split only (flips/rot90/ShiftScaleRotate/'
+                             'brightness-contrast/gamma/CLAHE/noise/blur; no distortion '
+                             'transforms), applied before the resize to load_width/'
+                             'load_height. Default off: data flow stays bitwise '
+                             'identical to the original pipeline (old experiments '
+                             'stay reproducible)')
+    parser.add_argument('--skel_loss_coef', default=0.0, type=float,
+                        help='Coefficient for the auxiliary SkeletonDistanceLoss '
+                             '(two-sided weighting: foreground skeleton + distance-decayed '
+                             'background rings; weight map computed per-batch from GT, '
+                             'detached). Default 0.0 disables it entirely — the loss is '
+                             'neither instantiated nor called, keeping the training path '
+                             'bit-identical to the original (old experiments stay '
+                             'reproducible)')
     return parser
 
 def main(args):
@@ -160,6 +176,7 @@ def main(args):
         f"bal_loss_coef={args.bal_loss_coef}, discretization={args.discretization}, "
         f"trap_lambda={args.trap_lambda}, use_ema={args.use_ema}, "
         f"boundary_alpha={args.boundary_alpha}, boundary_tau={args.boundary_tau}, "
+        f"strong_aug={args.strong_aug}, skel_loss_coef={args.skel_loss_coef}, "
         f"batch_size={args.batch_size}, lr={args.lr}, seed={args.seed}"
     )
     print(config_str)
