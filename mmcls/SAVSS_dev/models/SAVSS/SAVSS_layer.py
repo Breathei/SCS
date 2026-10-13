@@ -57,6 +57,10 @@ class SAVSS_2D(nn.Module):
     # 诊断日志全局开关（由 engine.py 在每 200 个 training step 触发一次）。
     _diag_active = False
     _diag_step = -1
+    # asr_scan_v2 路由诊断开关（同样由 engine.py 周期性触发）。
+    _router_diag_active = False
+    _router_diag_step = -1
+    _router_diag_entry = None
 
     def __init__(
             self,
@@ -80,6 +84,10 @@ class SAVSS_2D(nn.Module):
             trap_boundary="euler",
             trap_lambda_per_dir=False,
             scan_routing='none',
+            scan_param_order='current',
+            asr_beta=0.1,
+            asr_route_grid=1,
+            asr_v2_beta=0.25,
     ):
         super().__init__()
         # 保存状态空间模型超参数。
@@ -98,8 +106,20 @@ class SAVSS_2D(nn.Module):
         self.n_directions = 4
 
         self.scan_routing = scan_routing
-        assert self.scan_routing in ('none', 'asr'), \
+        assert self.scan_routing in ('none', 'asr', 'asr_scan', 'asr_scan_v2'), \
             f"Unsupported scan_routing: {self.scan_routing}"
+        self.scan_param_order = scan_param_order
+        assert self.scan_param_order in ('current', 'aligned'), \
+            f"Unsupported scan_param_order: {self.scan_param_order}"
+        self.asr_beta = float(asr_beta)
+        assert 0.0 <= self.asr_beta <= 1.0, \
+            f"asr_beta must be in [0, 1], got {self.asr_beta}"
+        self.asr_route_grid = int(asr_route_grid)
+        assert self.asr_route_grid in (1, 2, 4), \
+            f"asr_route_grid must be one of (1, 2, 4), got {self.asr_route_grid}"
+        self.asr_v2_beta = float(asr_v2_beta)
+        assert 0.0 <= self.asr_v2_beta <= 1.0, \
+            f"asr_v2_beta must be in [0, 1], got {self.asr_v2_beta}"
 
         self.discretization = discretization
         assert self.discretization in (
@@ -146,10 +166,14 @@ class SAVSS_2D(nn.Module):
                 self.last_trap_lambda = None
 
         # 自适应扫描路由器（Adaptive Scan Router）。
-        # 只在 asr 模式下实例化；none 模式下与原始代码完全等价。
-        if self.scan_routing == 'asr':
+        # 只在 asr / asr_scan / asr_scan_v2 模式下实例化；none 模式下与原始代码完全等价。
+        # asr_scan_v2 使用独立的 router_v2 namespace，便于 checkpoint sanitizer 区分版本。
+        if self.scan_routing in ('asr', 'asr_scan'):
             self.router = ScanRouter(self.d_model)
-            self.register_buffer('last_route_w', None)
+            self.last_route_w = None
+        elif self.scan_routing == 'asr_scan_v2':
+            self.router_v2 = ScanRouterV2(self.d_model)
+            self.last_route_w = None
 
         # Layer Scale 可学习系数，用于训练初期的稳定。
         self.init_layer_scale = init_layer_scale
@@ -345,10 +369,27 @@ class SAVSS_2D(nn.Module):
             (tuple(o1_inverse), tuple(o2_inverse), tuple(o3_inverse), tuple(o4_inverse)), \
             (tuple(d1), tuple(d2), tuple(d3), tuple(d4))
 
+    def _scan_params_for_order(self, order, dt, B, C, dB):
+        if self.scan_param_order == 'aligned':
+            # dB is already built in the current scan order from sass().
+            dt_dir = dt[:, :, order].contiguous()
+            B_dir = (B[:, :, order] + dB).contiguous()
+            C_dir = C[:, :, order].contiguous()
+        else:
+            dt_dir = dt
+            B_dir = (B + dB).contiguous()
+            C_dir = C
+        return dt_dir, B_dir, C_dir
+
     # SAVSS_2D 前向传播：完成 "投影 → 局部卷积 → 生成 dt/B/C → 4 向 selective scan → 融合 → 输出"。
     def forward(self, x, hw_shape):
         batch_size, L, _ = x.shape
         H, W = hw_shape
+        if L != H * W:
+            raise ValueError(
+                f"SAVSS_2D received L={L}, but hw_shape={hw_shape} "
+                f"implies {H * W} tokens"
+            )
         E = self.d_inner
 
         # 保留 SAVSS_2D 的输入，用于 ASR 路由器（asr 模式下根据原始特征图预测 4 向权重）。
@@ -428,14 +469,14 @@ class SAVSS_2D(nn.Module):
                 scan_kwargs["gated"] = True
 
             u_dir = x_conv[:, o, :].permute(0, 2, 1).contiguous()
-            B_dir = (B + dB).contiguous()
+            dt_dir, B_dir, C_dir = self._scan_params_for_order(o, dt, B, C, dB)
             y_scan.append(
                 scan_fn(
                     u_dir,
-                    dt,
+                    dt_dir,
                     A,
                     B_dir,
-                    C,
+                    C_dir,
                     self.D.float(),
                     z=None,
                     delta_bias=self.dt_proj.bias.float(),
@@ -448,7 +489,7 @@ class SAVSS_2D(nn.Module):
             # 诊断日志：仅在 SCAN_DIAG=1 且当前被触发时计算，不影响前向结果和梯度。
             if SAVSS_2D._diag_active and self.training:
                 d = _compute_scan_diag(
-                    u_dir, dt, A, B_dir,
+                    u_dir, dt_dir, A, B_dir,
                     D=self.D.float(),
                     delta_bias=self.dt_proj.bias.float(),
                     delta_softplus=True,
@@ -474,7 +515,7 @@ class SAVSS_2D(nn.Module):
 
         # 7) 4 向扫描结果融合，并用 SiLU 门控 z 进行调制，最后投影回 d_model。
         if self.scan_routing == 'asr':
-            # 路由器根据输入特征图预测 4 向权重：w ∈ (B, 4)。
+            # legacy ASR：每张图一个 4 路权重，保留旧 checkpoint/forward 语义。
             router_input = x_in.reshape(batch_size, H, W, self.d_model) \
                               .permute(0, 3, 1, 2).contiguous()
             w = self.router(router_input)              # (B, 4)
@@ -482,15 +523,66 @@ class SAVSS_2D(nn.Module):
             self.last_route_w = w.detach().clone()      # 供 epoch 日志使用
 
             # y = 4 * sum_k( w[:,k] * y_scan[k] ) * act(z)
-            # 将 y_scan 从 (B, L, E) 还原为 (B, E, H, W)，w[:,k] 广播为 (B, 1, H, W)。
             y_2d = sum(
                 w[:, k].view(batch_size, 1, 1, 1) *
                 y_scan[k].reshape(batch_size, H, W, E).permute(0, 3, 1, 2)
                 for k in range(4)
             )
             y = (4.0 * y_2d).permute(0, 2, 3, 1).reshape(batch_size, L, E)
+        elif self.scan_routing == 'asr_scan':
+            router_input = x_in.reshape(batch_size, H, W, self.d_model) \
+                              .permute(0, 3, 1, 2).contiguous()
+            branch_maps = torch.stack([
+                y_k.reshape(batch_size, H, W, E).permute(0, 3, 1, 2)
+                for y_k in y_scan
+            ], dim=1)
+            w, w_grid = self.router.scan_weights(
+                router_input, branch_maps, (H, W), self.asr_route_grid
+            )
+            self._route_w = w_grid
+            self.last_route_w = w_grid.detach().mean(dim=(-2, -1)).clone()
+
+            y_route = sum(
+                w[:, k:k + 1] * branch_maps[:, k]
+                for k in range(4)
+            ) * 4.0
+            y_base = branch_maps.sum(dim=1)
+            y_2d = y_base + self.asr_beta * (y_route - y_base)
+            y = y_2d.permute(0, 2, 3, 1).reshape(batch_size, L, E)
+        elif self.scan_routing == 'asr_scan_v2':
+            # V2：branch-advantage 描述子 + 零初始化 logit head，
+            # 初始与等和 baseline 严格等价，residual 强度用独立的 asr_v2_beta。
+            router_input = x_in.reshape(batch_size, H, W, self.d_model) \
+                              .permute(0, 3, 1, 2).contiguous()
+            branch_maps = torch.stack([
+                y_k.reshape(batch_size, H, W, E).permute(0, 3, 1, 2)
+                for y_k in y_scan
+            ], dim=1)
+            w, w_grid = self.router_v2.scan_weights(
+                router_input, branch_maps, (H, W), self.asr_route_grid
+            )
+            self._route_w = w_grid
+            self.last_route_w = w_grid.detach().mean(dim=(-2, -1)).clone()
+
+            y_route = sum(
+                w[:, k:k + 1] * branch_maps[:, k]
+                for k in range(4)
+            ) * 4.0
+            y_base = branch_maps.sum(dim=1)
+            y_2d = y_base + self.asr_v2_beta * (y_route - y_base)
+            y = y_2d.permute(0, 2, 3, 1).reshape(batch_size, L, E)
+
+            # 路由诊断：仅在 engine 触发时生成，全部 detach，不保留 autograd graph。
+            if SAVSS_2D._router_diag_active and self.training:
+                self._router_diag_entry = self._compute_router_diag(
+                    w_grid, branch_maps, y_route, y_base
+                )
+            else:
+                self._router_diag_entry = None
         else:
             # none 模式：保持原始等权求和，计算路径与参数量完全不变。
+            self._route_w = None
+            self.last_route_w = None
             y = sum(y_scan)
         y = y * self.act(z)
         out = self.out_proj(y)
@@ -498,6 +590,38 @@ class SAVSS_2D(nn.Module):
             out = out * self.gamma
 
         return out
+
+    @torch.no_grad()
+    def _compute_router_diag(self, w_grid, branch_maps, y_route, y_base):
+        """生成 asr_scan_v2 的单层路由诊断（全 detached 标量/列表）。"""
+        eps = 1e-12
+        probs = w_grid.detach().float()
+        entropy = -(probs * (probs + eps).log()).sum(dim=1)
+        argmax_idx = probs.reshape(probs.size(0), probs.size(1), -1).argmax(dim=1)
+        freq = [
+            float((argmax_idx == k).float().mean().item())
+            for k in range(self.n_directions)
+        ]
+        return {
+            "step": int(SAVSS_2D._router_diag_step),
+            "route_grid": self.asr_route_grid,
+            "beta": self.asr_v2_beta,
+            "entropy_mean": float(entropy.mean().item()),
+            "entropy_norm_mean": float((entropy / math.log(4.0)).mean().item()),
+            "w_mean": probs.mean(dim=(0, 2, 3)).tolist(),
+            "w_std_mean": float(probs.std(dim=1).mean().item()),
+            "w_min": float(probs.min().item()),
+            "w_max": float(probs.max().item()),
+            "argmax_freq": freq,
+            "branch_rms": [
+                float(branch_maps[:, k].detach().float().pow(2).mean().sqrt().item())
+                for k in range(self.n_directions)
+            ],
+            "residual_ratio": float(
+                ((y_route - y_base).detach().float().norm() /
+                 (y_base.detach().float().norm() + eps)).item()
+            ),
+        }
 
 
 class ScanRouter(nn.Module):
@@ -524,6 +648,152 @@ class ScanRouter(nn.Module):
         v = self.gap(x).view(b, -1)                 # (B, C)
         logits = self.fc2(self.relu(self.fc1(v)))   # (B, 4)
         return F.softmax(logits, dim=-1)            # (B, 4)
+
+    def scan_weights(self, context, branch_maps, hw_shape, route_grid=1):
+        """Return spatial scan weights and their coarse-grid counterpart.
+
+        ``context`` has shape ``(B, C, H, W)`` and ``branch_maps`` has shape
+        ``(B, 4, E, H, W)``.  The branch channels are reduced from E to C by
+        averaging the expand groups, so the legacy router projections can be
+        reused without adding a large descriptor projection.
+        """
+        batch_size, channels, height, width = context.shape
+        _, n_branches, inner_channels, _, _ = branch_maps.shape
+        if n_branches != 4 or channels != self.fc1.in_features:
+            raise ValueError(
+                f"Expected context (B, {self.fc1.in_features}, H, W) and "
+                f"four branches, got context={tuple(context.shape)}"
+            )
+        if inner_channels % channels != 0:
+            raise ValueError(
+                f"Branch channels {inner_channels} must be divisible by "
+                f"router channels {channels}"
+            )
+
+        route_grid = int(route_grid)
+        if route_grid not in (1, 2, 4):
+            raise ValueError(f"route_grid must be one of (1, 2, 4), got {route_grid}")
+
+        pool = nn.AdaptiveAvgPool2d((route_grid, route_grid))
+        context_grid = pool(context)
+        context_hidden = self.relu(
+            self.fc1(context_grid.permute(0, 2, 3, 1))
+        )
+        context_logits = self.fc2(context_hidden).permute(0, 3, 1, 2)
+
+        branch_grid = pool(
+            branch_maps.reshape(batch_size * n_branches, inner_channels,
+                                height, width)
+        ).reshape(batch_size, n_branches, inner_channels, route_grid, route_grid)
+        expand = inner_channels // channels
+        branch_desc = branch_grid.reshape(
+            batch_size, n_branches, expand, channels, route_grid, route_grid
+        ).mean(dim=2)
+        branch_hidden = self.relu(
+            self.fc1(branch_desc.permute(0, 1, 3, 4, 2))
+        )
+        # Each scan branch uses the corresponding row of fc2.  The operation
+        # is deliberately bias-free here; context_logits already contains the
+        # shared fc2 bias exactly once.
+        branch_logits = torch.einsum(
+            'bkrqh,kh->bkrq', branch_hidden, self.fc2.weight
+        )
+        grid_logits = context_logits + branch_logits
+        full_logits = F.interpolate(
+            grid_logits, size=(height, width), mode='bilinear',
+            align_corners=False
+        )
+        return F.softmax(full_logits, dim=1), F.softmax(grid_logits, dim=1)
+
+
+class ScanRouterV2(nn.Module):
+    """Branch-advantage 扫描路由器（asr_scan_v2）。
+
+    与 legacy ScanRouter 的区别：branch 描述子不再直接对每个扫描分支的输出
+    做平均（方向差异会在 pooling 时正负抵消），而是使用相对 4 分支均值的
+    signed advantage（branch_k - base）及其 magnitude：
+
+    1. branch maps 先按 expand 组 mean 降到 C 通道；
+    2. 计算 base = mean_k(branch_k)，advantage = branch_k - base；
+    3. 在 coarse route grid 上 pooling，按 grid cell 做 RMS 归一化
+       （防止某一层/某个方向的绝对扫描尺度直接决定路由），
+       同时保留 log1p(RMS) 标量作为幅度通道；
+    4. context 与每个 branch 的 descriptor 分别过共享 projection 后相加，
+       经四路 logit head 得到 coarse logits，再上采样并 softmax。
+
+    logit head 零初始化 → 初始权重精确为 1/4，残差融合起点与等和 baseline
+    严格等价；同时 head 直接从 branch contrast 获得非零 task gradient，
+    不受"最终层为零导致整条路径梯度被阻断"的影响。
+    """
+
+    def __init__(self, channels, hidden=None):
+        super().__init__()
+        self.channels = channels
+        hidden = hidden or max(4, channels // 4)
+        # +1：每个 branch 每格的 log1p(RMS) 幅度标量。
+        self.desc_proj = nn.Linear(channels + 1, hidden)
+        self.ctx_proj = nn.Linear(channels, hidden)
+        self.relu = nn.ReLU(inplace=True)
+        self.head = nn.Linear(hidden, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def scan_weights(self, context, branch_maps, hw_shape, route_grid=1):
+        """返回 full-resolution 与 coarse-grid 的 4 路 softmax 权重。
+
+        ``context`` 形状 (B, C, H, W)，``branch_maps`` 形状 (B, 4, E, H, W)，
+        其中 E 必须能被 C 整除（E = expand * C）。
+        """
+        batch_size, channels, height, width = context.shape
+        _, n_branches, inner_channels, _, _ = branch_maps.shape
+        if n_branches != 4 or channels != self.channels:
+            raise ValueError(
+                f"Expected context (B, {self.channels}, H, W) and "
+                f"four branches, got context={tuple(context.shape)}"
+            )
+        if inner_channels % channels != 0:
+            raise ValueError(
+                f"Branch channels {inner_channels} must be divisible by "
+                f"router channels {channels}"
+            )
+        route_grid = int(route_grid)
+        if route_grid not in (1, 2, 4):
+            raise ValueError(f"route_grid must be one of (1, 2, 4), got {route_grid}")
+
+        expand = inner_channels // channels
+        # (B, 4, E, H, W) -> 按 expand 组 mean -> (B, 4, C, H, W)
+        branch = branch_maps.reshape(
+            batch_size, n_branches, expand, channels, height, width
+        ).mean(dim=2)
+        base = branch.mean(dim=1, keepdim=True)
+        adv = branch - base                                   # signed advantage
+        adv_grid = F.adaptive_avg_pool2d(
+            adv.reshape(batch_size * n_branches, channels, height, width),
+            (route_grid, route_grid),
+        ).reshape(batch_size, n_branches, channels, route_grid, route_grid)
+        # 按 grid cell 在通道维做 RMS 归一化，剥离绝对尺度；幅度单独成通道。
+        # 注意 eps 必须放在 sqrt 内部：各分支完全相同（adv≡0）时 sqrt 在 0 处的
+        # 梯度为 inf，与上游零梯度相乘会产生 NaN（0*inf=nan）。
+        ms = adv_grid.pow(2).mean(dim=2, keepdim=True)
+        rms = torch.sqrt(ms + 1e-8)
+        signed = adv_grid / rms
+        magnitude = torch.log1p(rms)
+        desc = torch.cat([signed, magnitude], dim=2)          # (B,4,C+1,R,R)
+
+        desc_feat = self.relu(
+            self.desc_proj(desc.permute(0, 1, 3, 4, 2))
+        )                                                      # (B,4,R,R,hidden)
+        context_grid = F.adaptive_avg_pool2d(context, (route_grid, route_grid))
+        ctx_feat = self.relu(
+            self.ctx_proj(context_grid.permute(0, 2, 3, 1))
+        )                                                      # (B,R,R,hidden)
+        feat = desc_feat + ctx_feat.unsqueeze(1)
+        grid_logits = self.head(feat).squeeze(-1)              # (B,4,R,R)
+        full_logits = F.interpolate(
+            grid_logits, size=(height, width), mode='bilinear',
+            align_corners=False
+        )
+        return F.softmax(full_logits, dim=1), F.softmax(grid_logits, dim=1)
 
 
 # SAVSS_Layer: 完整的一个 SAVSS 层，通常堆叠多次构成 backbone。
@@ -574,7 +844,12 @@ class SAVSS_Layer(nn.Module):
 
     def forward(self, x, hw_shape):
         B, L, C = x.shape
-        H = W = int(math.sqrt(L))
+        H, W = hw_shape
+        if L != H * W:
+            raise ValueError(
+                f"SAVSS_Layer received L={L}, but hw_shape={hw_shape} "
+                f"implies {H * W} tokens"
+            )
         # 把 (B, L, C) 序列恢复成 (B, C, H, W) 以便做 2D 卷积。
         x = x.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
@@ -586,7 +861,12 @@ class SAVSS_Layer(nn.Module):
         x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
         mixed_x = self.drop_path(self.SAVSS_2D(self.norm(x), hw_shape))
         b, l, c = mixed_x.shape
-        h = w = int(math.sqrt(l))
+        h, w = hw_shape
+        if l != h * w:
+            raise ValueError(
+                f"SAVSS_Layer mixed output L={l}, but hw_shape={hw_shape} "
+                f"implies {h * w} tokens"
+            )
         # PAF：把原始局部特征 x 与全局扫描特征 mixed_x 进行融合。
         mixed_x = self.PAF_256(x.permute(0, 2, 1).reshape(b, c, h, w),
                                mixed_x.permute(0, 2, 1).reshape(b, c, h, w))

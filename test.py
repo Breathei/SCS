@@ -12,7 +12,7 @@ import cv2
 import util.misc as utils
 from datasets import create_dataset
 from models import build_model
-from main import get_args_parser
+from main import get_args_parser, sanitize_checkpoint_state_dict
 
 parser = argparse.ArgumentParser('SCSEGAMBA FOR CRACK', parents=[get_args_parser()])
 args = parser.parse_args()
@@ -28,10 +28,13 @@ if __name__ == '__main__':
     data_size = len(test_dl)
     model, criterion = build_model(args)
     try:
-        state_dict = torch.load(load_model_file, map_location=device, weights_only=False)
+        checkpoint = torch.load(load_model_file, map_location=device, weights_only=False)
     except TypeError:
-        state_dict = torch.load(load_model_file, map_location=device)
-    model.load_state_dict(state_dict.get("model", state_dict))
+        checkpoint = torch.load(load_model_file, map_location=device)
+    sanitize_checkpoint_state_dict(
+        checkpoint.get("model", checkpoint), model,
+        scan_routing=getattr(args, 'scan_routing', 'none')
+    )
     model.to(device)
     print("Load Model Successful!")
     suffix = os.path.splitext(os.path.basename(load_model_file))[0]

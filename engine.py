@@ -15,37 +15,70 @@ from tqdm import tqdm
 # engine → SAVSS_layer → models/__init__ → decoder → SAVSS.py → SAVSS_layer(未初始化完)
 
 
+def _route_weights_as_samples(route_w):
+    """Normalize global/grid route weights to (batch, samples, directions)."""
+    if route_w.dim() == 2:
+        return route_w.unsqueeze(1)
+    if route_w.dim() == 4:
+        return route_w.permute(0, 2, 3, 1).reshape(route_w.size(0), -1, route_w.size(1))
+    raise ValueError(f"Unexpected route weight shape: {tuple(route_w.shape)}")
+
+
 def compute_balancing_loss(model):
-    """ASR 负载均衡损失。
+    """Compute per-layer soft route coverage loss.
 
-    L_bal = 4 * sum_k( w_bar_k * f_k )
-    - w_bar_k：路径 k 的 soft 平均权重（对 batch 和层求平均，可微）。
-    - f_k：路径 k 被“选中”的频率（argmax 的 detached one-hot 平均）。
+    Each layer is reduced independently, so a collapsed layer cannot be hidden
+    by a different layer.  The detached second factor keeps the loss scale
+    stable while avoiding argmax tie bias at uniform initialization.
+
+    Used by legacy ``asr`` / ``asr_scan`` only; ``asr_scan_v2`` uses the
+    anti-collapse coverage loss below instead.
     """
-    route_ws = []
+    layer_losses = []
     for m in model.modules():
-        if hasattr(m, '_route_w') and m._route_w is not None:
-            route_ws.append(m._route_w)
-    if not route_ws:
+        if getattr(m, 'scan_routing', None) == 'asr_scan_v2':
+            continue
+        route_w = getattr(m, '_route_w', None)
+        if route_w is None:
+            continue
+        samples = _route_weights_as_samples(route_w)
+        p = samples.mean(dim=(0, 1))
+        layer_losses.append(4.0 * (p * p.detach()).sum())
+    if not layer_losses:
         return None
+    return torch.stack(layer_losses).mean()
 
-    all_w = torch.cat(route_ws, dim=0)          # (N, 4)
-    w_bar = all_w.mean(dim=0)                    # (4,)
 
-    max_idx = all_w.argmax(dim=-1)               # (N,)
-    f_onehot = torch.zeros_like(all_w)
-    f_onehot.scatter_(1, max_idx.unsqueeze(1), 1.0)
-    f = f_onehot.detach().mean(dim=0)            # (4,)
+def compute_asr_v2_coverage_loss(model, coverage_cap=0.6):
+    """Anti-collapse coverage loss for asr_scan_v2 (one-sided upper cap).
 
-    return 4.0 * (w_bar * f).sum()
+    Unlike the legacy uniformizing balancing loss (whose optimum is the
+    uniform distribution), this only penalizes a direction whose per-layer
+    average share exceeds ``coverage_cap``, so meaningful nonuniform routing
+    is not pulled back to uniform.
+    """
+    layer_losses = []
+    for m in model.modules():
+        if getattr(m, 'scan_routing', None) != 'asr_scan_v2':
+            continue
+        route_w = getattr(m, '_route_w', None)
+        if route_w is None:
+            continue
+        samples = _route_weights_as_samples(route_w)
+        p = samples.mean(dim=(0, 1))
+        layer_losses.append(torch.relu(p - coverage_cap).pow(2).sum())
+    if not layer_losses:
+        return None
+    return torch.stack(layer_losses).mean()
 
 
 class ModelEMA:
-    """模型参数的指数滑动平均（EMA）。
+    """模型参数与 buffers 的指数滑动平均（EMA）。
 
-    只跟踪 named_parameters（GN 只有 weight/bias 参数、无 running buffer，
-    无需特殊处理）。EMA 不参与训练路径：前向/反向始终使用原始权重，
-    shadow 仅用于 eval 与 checkpoint 保存。
+    参数使用指数滑动平均；BatchNorm 等 running buffers 在每次更新时直接
+    同步当前模型值，并保持整数 buffer（如 num_batches_tracked）的类型。
+    EMA 不参与训练路径：前向/反向始终使用原始权重，shadow 仅用于 eval
+    与 checkpoint 保存。
 
     更新规则：shadow = d * shadow + (1 - d) * param
     warmup：前 warmup_steps 步使用 d_t = min(decay, (1 + step) / (10 + step))。
@@ -56,6 +89,7 @@ class ModelEMA:
         self.warmup_steps = warmup_steps
         self.updates = 0
         self.shadow = {n: p.detach().clone() for n, p in model.named_parameters()}
+        self.buffers = {n: b.detach().clone() for n, b in model.named_buffers()}
 
     @torch.no_grad()
     def update(self, model):
@@ -66,35 +100,52 @@ class ModelEMA:
             d = self.decay
         for n, p in model.named_parameters():
             self.shadow[n].mul_(d).add_(p.detach(), alpha=1.0 - d)
+        for n, b in model.named_buffers():
+            # Buffers include integer counters as well as floating-point running
+            # statistics, so copying is safer than applying the parameter EMA rule.
+            self.buffers[n].copy_(b.detach())
 
     def state_dict(self):
         return {
             'shadow': {n: t.detach().clone() for n, t in self.shadow.items()},
+            'buffers': {n: t.detach().clone() for n, t in self.buffers.items()},
             'updates': self.updates,
         }
 
     def load_state_dict(self, state):
-        # 兼容纯权重 dict（无 'shadow' 包装）的存档。
+        # 兼容纯权重 dict（无 'shadow' 包装）以及旧版仅保存参数的 EMA。
         if 'shadow' in state:
             self.updates = state.get('updates', 0)
-            state = state['shadow']
-        for n, t in state.items():
+            shadow_state = state['shadow']
+            buffer_state = state.get('buffers', {})
+        else:
+            shadow_state = state
+            buffer_state = {}
+        for n, t in shadow_state.items():
             if n in self.shadow:
                 self.shadow[n].copy_(t)
+        for n, t in buffer_state.items():
+            if n in self.buffers:
+                self.buffers[n].copy_(t)
 
     @torch.no_grad()
     def apply_to(self, model):
-        """把 shadow 权重写入 model，返回原始权重备份（eval 完后用 restore 恢复）。"""
+        """把 EMA 状态写入 model，返回原始状态备份供 restore 使用。"""
         backup = {}
         for n, p in model.named_parameters():
             backup[n] = p.detach().clone()
             p.copy_(self.shadow[n])
+        for n, b in model.named_buffers():
+            backup[n] = b.detach().clone()
+            b.copy_(self.buffers[n])
         return backup
 
     @torch.no_grad()
     def restore(self, model, backup):
         for n, p in model.named_parameters():
             p.copy_(backup[n])
+        for n, b in model.named_buffers():
+            b.copy_(backup[n])
 
 
 def _write_scan_diag(model):
@@ -120,6 +171,43 @@ def _write_scan_diag(model):
             f.write(json.dumps(e) + '\n')
 
 
+def _write_router_diag(model):
+    """把当前 step 各 SAVSS_2D 层的 asr_scan_v2 路由诊断写入 asr_router_diag.jsonl。
+
+    必须在 backward() 之后调用，这样才能附带 router 各 projection 的梯度范数。
+    """
+    from mmcls.SAVSS_dev.models.SAVSS.SAVSS_layer import SAVSS_2D  # 延迟导入，避免循环
+    entries = []
+    layer_idx = 0
+    for name, m in model.named_modules():
+        if isinstance(m, SAVSS_2D):
+            entry = getattr(m, '_router_diag_entry', None)
+            if entry is not None:
+                entry = dict(entry)
+                entry['layer_idx'] = layer_idx
+                router = getattr(m, 'router_v2', None)
+                if router is not None:
+                    for label, param in (
+                        ('head_grad_norm', router.head.weight),
+                        ('desc_proj_grad_norm', router.desc_proj.weight),
+                        ('ctx_proj_grad_norm', router.ctx_proj.weight),
+                    ):
+                        if param.grad is not None:
+                            entry[label] = float(
+                                param.grad.detach().float().norm().item()
+                            )
+                entries.append(entry)
+            m._router_diag_entry = None
+            layer_idx += 1
+
+    if not entries:
+        return
+
+    with open('asr_router_diag.jsonl', 'a', encoding='utf-8') as f:
+        for e in entries:
+            f.write(json.dumps(e) + '\n')
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                      epoch: int, args = None, logger = None, ema: 'ModelEMA' = None):
@@ -137,6 +225,20 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     bal_loss_cnt = 0
     route_w_sums = {}
     route_w_counts = {}
+
+    # asr_scan_v2：独立的 anti-collapse coverage loss（带 warmup + linear ramp），
+    # 不使用 legacy 的均匀化 balancing loss；诊断开关只在 v2 模式下生效。
+    scan_routing = getattr(args, 'scan_routing', 'none')
+    asr_v2_mode = scan_routing == 'asr_scan_v2'
+    asr_router_diag = bool(getattr(args, 'asr_router_diag', False)) and asr_v2_mode
+    cover_coef = float(getattr(args, 'asr_v2_coverage_coef', 0.01))
+    cover_cap = float(getattr(args, 'asr_v2_coverage_cap', 0.6))
+    warmup_ratio = float(getattr(args, 'asr_v2_balance_warmup_ratio', 0.1))
+    total_steps_est = max(1, int(getattr(args, 'epochs', 1)) * len(data_loader))
+    cover_warmup_steps = int(total_steps_est * warmup_ratio)
+    cover_sum = 0.0
+    cover_cnt = 0
+    cover_coef_sum = 0.0
 
     # SkeletonDistanceLoss：--skel_loss_coef>0 时才实例化并参与反传；
     # coef=0（默认）不创建、不调用，训练路径与现状逐 bit 一致。
@@ -167,6 +269,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         else:
             SAVSS_2D._diag_active = False
 
+        # asr_scan_v2 路由诊断：同一节奏（每 200 step），只在 --asr_router_diag 时启用。
+        router_diag_should_run = asr_router_diag and (global_step % 200 == 0)
+        SAVSS_2D._router_diag_active = router_diag_should_run
+        SAVSS_2D._router_diag_step = global_step
+
         output = model(samples)
         loss_final = criterion(output, targets.float(), weight=weights)
 
@@ -174,25 +281,48 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             _write_scan_diag(model)
             SAVSS_2D._diag_active = False
 
-        L_bal = compute_balancing_loss(model)
-        if L_bal is not None:
-            total_loss = loss_final + args.bal_loss_coef * L_bal
-            bal_loss_sum += L_bal.item()
-            bal_loss_cnt += 1
-
-            # 收集每层的 4 路平均权重，供 epoch 日志使用。
-            for name, m in model.named_modules():
-                if hasattr(m, 'last_route_w') and m.last_route_w is not None:
-                    rw = m.last_route_w                      # (B, 4)
-                    if name not in route_w_sums:
-                        route_w_sums[name] = torch.zeros(4, device=rw.device)
-                        route_w_counts[name] = 0
-                    route_w_sums[name] += rw.sum(dim=0)
-                    route_w_counts[name] += rw.size(0)
-        else:
-            total_loss = loss_final
+        if asr_v2_mode:
+            # V2：one-sided anti-collapse coverage loss，前 warmup_steps 步系数为 0，
+            # 随后同样长度线性 ramp 到目标系数；不用 legacy 的均匀化 balancing loss。
+            L_cover = compute_asr_v2_coverage_loss(model, coverage_cap=cover_cap)
+            if cover_warmup_steps <= 0:
+                ramp = 1.0
+            elif global_step < cover_warmup_steps:
+                ramp = 0.0
+            else:
+                ramp = min(1.0, (global_step - cover_warmup_steps) / cover_warmup_steps)
+            coef_eff = cover_coef * ramp
+            if L_cover is not None:
+                cover_sum += L_cover.item()
+                cover_cnt += 1
+                cover_coef_sum += coef_eff
+                total_loss = loss_final + coef_eff * L_cover
+            else:
+                total_loss = loss_final
             bal_loss_sum += 0.0
             bal_loss_cnt += 1
+        else:
+            L_bal = compute_balancing_loss(model)
+            if L_bal is not None:
+                total_loss = loss_final + args.bal_loss_coef * L_bal
+                bal_loss_sum += L_bal.item()
+                bal_loss_cnt += 1
+            else:
+                total_loss = loss_final
+                bal_loss_sum += 0.0
+                bal_loss_cnt += 1
+
+        # 收集每层的 4 路平均权重，供 epoch 日志使用（所有路由模式共用）。
+        for name, m in model.named_modules():
+            if hasattr(m, 'last_route_w') and m.last_route_w is not None:
+                rw = m.last_route_w
+                if rw.dim() == 4:
+                    rw = rw.mean(dim=(-2, -1))
+                if name not in route_w_sums:
+                    route_w_sums[name] = torch.zeros(4, device=rw.device)
+                    route_w_counts[name] = 0
+                route_w_sums[name] += rw.sum(dim=0)
+                route_w_counts[name] += rw.size(0)
 
         if skel_criterion is not None:
             total_loss = total_loss + skel_coef * skel_criterion(output, targets)
@@ -207,9 +337,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         pbar.update(1)
         optimizer.zero_grad()
         total_loss.backward()
+        if router_diag_should_run:
+            # backward 之后才能拿到 router 各 projection 的梯度范数。
+            _write_router_diag(model)
+            SAVSS_2D._router_diag_active = False
         optimizer.step()
         if ema is not None:
-            # EMA 只读参数做滑动平均，不改动模型权重，不影响训练路径。
+            # EMA 只更新 shadow，不改动模型权重，不影响训练路径。
             ema.update(model)
         global_step += 1
 
@@ -221,4 +355,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     for name in route_w_sums:
         route_w_avgs[name] = (route_w_sums[name] / route_w_counts[name]).tolist()
 
-    return {'bal_loss': avg_bal_loss, 'route_w_avgs': route_w_avgs}
+    result = {'bal_loss': avg_bal_loss, 'route_w_avgs': route_w_avgs}
+    if asr_v2_mode:
+        result['coverage_loss'] = cover_sum / cover_cnt if cover_cnt else 0.0
+        result['coverage_coef_eff'] = cover_coef_sum / cover_cnt if cover_cnt else 0.0
+    return result

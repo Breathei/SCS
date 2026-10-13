@@ -71,7 +71,11 @@ def build(args):
                      trap_lambda=getattr(args, 'trap_lambda', 0.5),
                      trap_boundary=getattr(args, 'trap_boundary', 'euler'),
                      trap_lambda_per_dir=getattr(args, 'trap_lambda_per_dir', False),
-                     scan_routing=getattr(args, 'scan_routing', 'none'))
+                     scan_routing=getattr(args, 'scan_routing', 'none'),
+                     scan_param_order=getattr(args, 'scan_param_order', 'current'),
+                     asr_beta=getattr(args, 'asr_beta', 0.1),
+                     asr_route_grid=getattr(args, 'asr_route_grid', 1),
+                     asr_v2_beta=getattr(args, 'asr_v2_beta', 0.25))
     model = Decoder(backbone, args)
     criterion = bce_dice(args)
     criterion.to(device)

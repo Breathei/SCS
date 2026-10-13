@@ -7,9 +7,10 @@ ASR 验收测试：参数量报告。
 对于 Crack 配置 C=256，即为 4 * (256*64 + 64*4 + 64 + 4) = 66,832。
 """
 import argparse
+import os
 import sys
 
-sys.path.insert(0, '/home/xby/SCSegamba')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from main import get_args_parser
 from models import build_model
 

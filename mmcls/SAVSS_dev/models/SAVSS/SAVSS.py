@@ -73,6 +73,10 @@ class SAVSS(BaseBackbone):
                  trap_boundary='euler',
                  trap_lambda_per_dir=False,
                  scan_routing='none',
+                 scan_param_order='current',
+                 asr_beta=0.1,
+                 asr_route_grid=1,
+                 asr_v2_beta=0.25,
                  **kwargs):
         super(SAVSS, self).__init__(init_cfg)
 
@@ -86,6 +90,10 @@ class SAVSS(BaseBackbone):
         self.trap_boundary = trap_boundary
         self.trap_lambda_per_dir = trap_lambda_per_dir
         self.scan_routing = scan_routing
+        self.scan_param_order = scan_param_order
+        self.asr_beta = asr_beta
+        self.asr_route_grid = asr_route_grid
+        self.asr_v2_beta = asr_v2_beta
 
         if self.arch is None:
             self.embed_dims = embed_dims
@@ -160,6 +168,10 @@ class SAVSS(BaseBackbone):
                 _layer_cfg_i["mamba_cfg"]["trap_boundary"] = self.trap_boundary
                 _layer_cfg_i["mamba_cfg"]["trap_lambda_per_dir"] = self.trap_lambda_per_dir
                 _layer_cfg_i["mamba_cfg"]["scan_routing"] = self.scan_routing
+                _layer_cfg_i["mamba_cfg"]["scan_param_order"] = self.scan_param_order
+                _layer_cfg_i["mamba_cfg"]["asr_beta"] = self.asr_beta
+                _layer_cfg_i["mamba_cfg"]["asr_route_grid"] = self.asr_route_grid
+                _layer_cfg_i["mamba_cfg"]["asr_v2_beta"] = self.asr_v2_beta
             if i in self.layers_with_dwconv:
                 _layer_cfg_i.update({"with_dwconv": True})
             else:

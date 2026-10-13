@@ -6,18 +6,15 @@ asr 模式下跑 2 个 training step，确认：
 2. 所有参数无 NaN。
 """
 import argparse
+import os
 import sys
 
 import torch
 
-sys.path.insert(0, '/home/xby/SCSegamba')
-from main import get_args_parser
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from main import get_args_parser, sanitize_checkpoint_state_dict
 from models import build_model
 from engine import compute_balancing_loss
-
-
-def strip_stale(state_dict):
-    return {k: v for k, v in state_dict.items() if 'trap_gate_logit' not in k}
 
 
 def main():
@@ -31,7 +28,9 @@ def main():
 
     model, criterion = build_model(args)
     ckpt = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
-    model.load_state_dict(strip_stale(ckpt.get('model', ckpt)), strict=False)
+    sanitize_checkpoint_state_dict(
+        ckpt.get('model', ckpt), model, scan_routing=args.scan_routing
+    )
     model.train().to(args.device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)

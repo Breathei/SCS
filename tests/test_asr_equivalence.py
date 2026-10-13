@@ -6,17 +6,14 @@ asr 模式在零初始化下应与 none 模式逐元素等价。
 比较 scan_routing='asr' 与 scan_routing='none' 的输出最大绝对误差 < 1e-5。
 """
 import argparse
+import os
 import sys
 
 import torch
 
-sys.path.insert(0, '/home/xby/SCSegamba')
-from main import get_args_parser
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from main import get_args_parser, sanitize_checkpoint_state_dict
 from models import build_model
-
-
-def strip_stale(state_dict):
-    return {k: v for k, v in state_dict.items() if 'trap_gate_logit' not in k}
 
 
 def main():
@@ -35,11 +32,11 @@ def main():
     model_asr, _ = build_model(args_asr)
 
     ckpt = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
-    sd = strip_stale(ckpt.get('model', ckpt))
+    sd = ckpt.get('model', ckpt)
 
-    # none 模式结构与权重完全一致；asr 模式多出 router（零初始化），用 strict=False。
-    model_none.load_state_dict(sd, strict=True)
-    model_asr.load_state_dict(sd, strict=False)
+    # none 模式结构与权重完全一致；asr 模式多出 router（零初始化）。
+    sanitize_checkpoint_state_dict(sd, model_none, scan_routing='none')
+    sanitize_checkpoint_state_dict(sd, model_asr, scan_routing='asr')
 
     model_none.eval().to(args.device)
     model_asr.eval().to(args.device)

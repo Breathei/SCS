@@ -23,6 +23,106 @@ from tqdm import tqdm
 from mmengine.optim.scheduler.lr_scheduler import PolyLR
 
 
+def sanitize_checkpoint_state_dict(state_dict, model, scan_routing='none', logger=None):
+    """Load only compatible checkpoint keys for route-mode transitions.
+
+    Router namespaces are version-aware:
+    - legacy router (``router.*``) is used by ``asr`` / ``asr_scan``;
+    - v2 router (``router_v2.*``) is used by ``asr_scan_v2``;
+    - ``none`` uses neither.
+
+    A checkpoint that completely lacks the target router namespace loads with
+    the model's freshly initialized router (reported).  A checkpoint with a
+    *partial* router state is rejected.  All non-router keys stay strict.
+    """
+    state_dict = dict(state_dict)
+    ignored = []
+
+    def drop_keys(keys):
+        for key in keys:
+            ignored.append(key)
+            state_dict.pop(key)
+
+    def is_router_v2_key(key):
+        return key.startswith('router_v2.') or '.router_v2.' in key
+
+    def is_router_key(key):
+        # legacy router namespace, excluding router_v2.*
+        return (key.startswith('router.') or '.router.' in key) \
+            and not is_router_v2_key(key)
+
+    drop_keys([k for k in list(state_dict) if 'trap_gate_logit' in k])
+    drop_keys([k for k in list(state_dict) if k.endswith('last_route_w')])
+
+    target_legacy = scan_routing in ('asr', 'asr_scan')
+    target_v2 = scan_routing == 'asr_scan_v2'
+    # 目标模式不使用的 router namespace 直接从 source 中剔除并记录。
+    if not target_legacy:
+        drop_keys([k for k in list(state_dict) if is_router_key(k)])
+    if not target_v2:
+        drop_keys([k for k in list(state_dict) if is_router_v2_key(k)])
+
+    model_state = model.state_dict()
+    missing = sorted(k for k in model_state if k not in state_dict)
+    unexpected = sorted(k for k in state_dict if k not in model_state)
+    allowed_missing = []
+
+    def check_router_namespace(pred, label):
+        # source 完全缺少目标 router → 允许缺失（模型用初始化值）；
+        # source 只含部分 router key → 视为损坏的 checkpoint，拒绝加载。
+        source_keys = {k for k in state_dict if pred(k)}
+        model_keys = {k for k in model_state if pred(k)}
+        if not source_keys:
+            allowed_missing.extend(k for k in missing if pred(k))
+        elif source_keys != model_keys:
+            raise RuntimeError(
+                f"Checkpoint contains an incomplete {label} router state: "
+                f"found={sorted(source_keys)}, expected={sorted(model_keys)}"
+            )
+
+    if target_legacy:
+        check_router_namespace(is_router_key, 'legacy')
+    if target_v2:
+        check_router_namespace(is_router_v2_key, 'v2')
+
+    bad_missing = [k for k in missing if k not in allowed_missing]
+    if unexpected or bad_missing:
+        raise RuntimeError(
+            "Checkpoint keys are incompatible: "
+            f"missing={bad_missing}, unexpected={unexpected}"
+        )
+
+    for k, v in state_dict.items():
+        if k in model_state:
+            ckpt_shape = tuple(v.shape)
+            model_shape = tuple(model_state[k].shape)
+            if ckpt_shape != model_shape:
+                raise RuntimeError(
+                    f"Checkpoint shape mismatch for {k}: "
+                    f"checkpoint {ckpt_shape} vs model {model_shape}"
+                )
+
+    if ignored:
+        msg = "Ignoring checkpoint keys: " + str(ignored)
+        if logger is not None:
+            logger.info(msg)
+        print(msg)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    unexpected_loaded = list(incompatible.unexpected_keys)
+    missing_loaded = [k for k in incompatible.missing_keys if k not in allowed_missing]
+    if unexpected_loaded or missing_loaded:
+        raise RuntimeError(
+            "Checkpoint load failed after filtering: "
+            f"missing={missing_loaded}, unexpected={unexpected_loaded}"
+        )
+    if allowed_missing:
+        msg = "Initialized missing router keys from model defaults: " + str(allowed_missing)
+        if logger is not None:
+            logger.info(msg)
+        print(msg)
+    return ignored, allowed_missing
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('SCSEGAMBA FOR CRACK', add_help=False)
 
@@ -95,9 +195,41 @@ def get_args_parser():
                         help='Learn a separate lambda for each of the 4 SASS scan '
                              'directions in gated_trapezoid (default: one scalar per layer)')
     parser.add_argument('--scan_routing', default='none', type=str,
-                        choices=['none', 'asr'],
+                        choices=['none', 'asr', 'asr_scan', 'asr_scan_v2'],
                         help='Adaptive scan routing: none (default, identical to original '
-                             'code) or asr (per-image weighted fusion of 4 SASS directions)')
+                             'code), asr (legacy per-image weighted fusion), '
+                             'asr_scan (scan-aware residual grid routing), or '
+                             'asr_scan_v2 (branch-advantage descriptor routing, opt-in)')
+    parser.add_argument('--scan_param_order', default='current', type=str,
+                        choices=['current', 'aligned'],
+                        help='Selective-scan parameter order: current (legacy behavior) '
+                             'or aligned (reorder dt/B/C with each SASS direction)')
+    parser.add_argument('--asr_beta', default=0.1, type=float,
+                        help='Residual strength for asr_scan fusion (0..1, default 0.1)')
+    parser.add_argument('--asr_route_grid', default=1, type=int,
+                        choices=[1, 2, 4],
+                        help='Coarse spatial grid for asr_scan/asr_scan_v2 routing '
+                             '(default: 1)')
+    parser.add_argument('--asr_v2_beta', default=0.25, type=float,
+                        help='Residual strength for asr_scan_v2 fusion (0..1, '
+                             'default 0.25); legacy asr_scan keeps using --asr_beta')
+    parser.add_argument('--asr_router_lr_mult', default=1.0, type=float,
+                        help='Learning-rate multiplier applied to router_v2 parameters '
+                             'only (default 1.0; e.g. 4.0 for v2 experiments)')
+    parser.add_argument('--asr_v2_coverage_coef', default=0.01, type=float,
+                        help='Coefficient for the asr_scan_v2 anti-collapse coverage '
+                             'loss (default 0.01)')
+    parser.add_argument('--asr_v2_coverage_cap', default=0.6, type=float,
+                        help='Per-layer per-direction average route share cap for the '
+                             'asr_scan_v2 coverage loss (default 0.6)')
+    parser.add_argument('--asr_v2_balance_warmup_ratio', default=0.1, type=float,
+                        help='Fraction of total optimizer steps with zero coverage '
+                             'loss, followed by a linear ramp of the same length '
+                             '(default 0.1)')
+    parser.add_argument('--asr_router_diag', action='store_true',
+                        help='Enable periodic detached router diagnostics for '
+                             'asr_scan_v2 (written to asr_router_diag.jsonl every '
+                             '200 training steps)')
     parser.add_argument('--bal_loss_coef', default=0.01, type=float,
                         help='Coefficient for the ASR balancing loss (default: 0.01)')
     parser.add_argument('--use_ema', action='store_true',
@@ -171,14 +303,48 @@ def main(args):
     args.batch_size = args.batch_size_train
 
     # 训练开始第一行打印完整配置（读取自实际生效的 args，禁止硬编码）。
+    if not 0.0 <= float(getattr(args, 'asr_beta', 0.1)) <= 1.0:
+        raise ValueError(f"asr_beta must be in [0, 1], got {args.asr_beta}")
+    if int(getattr(args, 'asr_route_grid', 1)) not in (1, 2, 4):
+        raise ValueError(
+            f"asr_route_grid must be one of (1, 2, 4), got {args.asr_route_grid}"
+        )
+    if not 0.0 <= float(getattr(args, 'asr_v2_beta', 0.25)) <= 1.0:
+        raise ValueError(f"asr_v2_beta must be in [0, 1], got {args.asr_v2_beta}")
+    if not 0.0 < float(getattr(args, 'asr_v2_coverage_cap', 0.6)) <= 1.0:
+        raise ValueError(
+            f"asr_v2_coverage_cap must be in (0, 1], got {args.asr_v2_coverage_cap}"
+        )
+    if not 0.0 <= float(getattr(args, 'asr_v2_balance_warmup_ratio', 0.1)) <= 1.0:
+        raise ValueError(
+            "asr_v2_balance_warmup_ratio must be in [0, 1], "
+            f"got {args.asr_v2_balance_warmup_ratio}"
+        )
+    if float(getattr(args, 'asr_router_lr_mult', 1.0)) <= 0.0:
+        raise ValueError(
+            f"asr_router_lr_mult must be positive, got {args.asr_router_lr_mult}"
+        )
     config_str = (
         f"Training config: scan_routing={args.scan_routing}, "
+        f"scan_param_order={getattr(args, 'scan_param_order', 'current')}, "
+        f"asr_beta={getattr(args, 'asr_beta', 0.1)}, "
+        f"asr_route_grid={getattr(args, 'asr_route_grid', 1)}, "
         f"bal_loss_coef={args.bal_loss_coef}, discretization={args.discretization}, "
         f"trap_lambda={args.trap_lambda}, use_ema={args.use_ema}, "
         f"boundary_alpha={args.boundary_alpha}, boundary_tau={args.boundary_tau}, "
         f"strong_aug={args.strong_aug}, skel_loss_coef={args.skel_loss_coef}, "
         f"batch_size={args.batch_size}, lr={args.lr}, seed={args.seed}"
     )
+    if args.scan_routing == 'asr_scan_v2':
+        config_str += (
+            f", asr_v2_beta={getattr(args, 'asr_v2_beta', 0.25)}, "
+            f"asr_router_lr_mult={getattr(args, 'asr_router_lr_mult', 1.0)}, "
+            f"asr_v2_coverage_coef={getattr(args, 'asr_v2_coverage_coef', 0.01)}, "
+            f"asr_v2_coverage_cap={getattr(args, 'asr_v2_coverage_cap', 0.6)}, "
+            f"asr_v2_balance_warmup_ratio="
+            f"{getattr(args, 'asr_v2_balance_warmup_ratio', 0.1)}, "
+            f"asr_router_diag={getattr(args, 'asr_router_diag', False)}"
+        )
     print(config_str)
     log_train.info(config_str)
 
@@ -197,61 +363,18 @@ def main(args):
         except TypeError:
             checkpoint = torch.load(resume_path, map_location=device)
         state_dict = checkpoint.get('model', checkpoint)
-        # Backward compatibility: older checkpoints may contain the removed
-        # trap_gate_logit parameter. Strip it before loading.
-        stale_gate_keys = [k for k in state_dict if 'trap_gate_logit' in k]
-        if stale_gate_keys:
-            for k in stale_gate_keys:
-                state_dict.pop(k)
-            log_train.info(
-                "Ignoring stale trap_gate_logit parameters from checkpoint: "
-                + str(stale_gate_keys)
-            )
-            print(
-                "Ignoring stale trap_gate_logit parameters from checkpoint: "
-                + str(stale_gate_keys)
-            )
-        # ASR 监控 buffer last_route_w 初始注册为 None（不计入 state_dict），
-        # 训练中变成张量后会被存进 checkpoint；加载到 None buffer 会报
-        # unexpected key。它只是日志用的 detached 副本，首个 forward 即被
-        # 覆盖，直接剔除。
-        route_w_buf_keys = [k for k in state_dict if k.endswith('last_route_w')]
-        if route_w_buf_keys:
-            for k in route_w_buf_keys:
-                state_dict.pop(k)
-            log_train.info(
-                "Ignoring last_route_w monitoring buffers from checkpoint: "
-                + str(route_w_buf_keys)
-            )
-            print(
-                "Ignoring last_route_w monitoring buffers from checkpoint: "
-                + str(route_w_buf_keys)
-            )
-        # Explicit shape check for trap_lambda_logit to give a clear error when
-        # switching between scalar and per-direction checkpoints.
-        model_state = model.state_dict()
-        for k in state_dict:
-            if 'trap_lambda_logit' in k and k in model_state:
-                ckpt_shape = tuple(state_dict[k].shape)
-                model_shape = tuple(model_state[k].shape)
-                if ckpt_shape != model_shape:
-                    raise RuntimeError(
-                        f"Checkpoint shape mismatch for {k}: "
-                        f"checkpoint {ckpt_shape} vs model {model_shape}. "
-                        f"This usually happens when resuming a checkpoint saved with "
-                        f"scalar lambda into a model with --trap_lambda_per_dir (or vice versa). "
-                        f"Please ensure --trap_lambda_per_dir matches the checkpoint."
-                    )
-        model.load_state_dict(state_dict, strict=True)
+        sanitize_checkpoint_state_dict(
+            state_dict, model, scan_routing=args.scan_routing, logger=log_train
+        )
         resume_optimizer_state = checkpoint.get('optimizer')
         resume_scheduler_state = checkpoint.get('lr_scheduler')
         resume_ema_state = checkpoint.get('model_ema')
         if 'epoch' in checkpoint:
             start_epoch = checkpoint['epoch'] + 1
 
-    # EMA：训练开始时创建参数 shadow 副本（含 GN 的 weight/bias；GN 无 running
-    # buffer，无需特殊处理）。只在每个 optimizer.step() 之后更新，训练前向/反向
-    # 始终使用原始权重；shadow 仅用于 eval 和 checkpoint 保存。
+    # EMA：训练开始时创建参数与 buffers 的 shadow 副本。只在每个
+    # optimizer.step() 之后更新，训练前向/反向始终使用原始权重；shadow
+    # 仅用于 eval 和 checkpoint 保存。
     model_ema = None
     if args.use_ema:
         model_ema = ModelEMA(model, decay=0.999, warmup_steps=1000)
@@ -268,9 +391,15 @@ def main(args):
     log_train.info('The number of training images = %d' % dataset_size)
 
     # λ 标量参数使用 10 倍学习率，使其在 sigmoid 边界附近也能有效更新。
+    # router_v2 参数从 base 组拆出，可使用独立的 LR multiplier（默认 1.0，
+    # 此时分组存在与否不影响实际学习率，旧模式参数组完全不变）。
+    router_v2_params = [
+        p for n, p in model.named_parameters()
+        if 'router_v2' in n
+    ]
     base_params = [
         p for n, p in model.named_parameters()
-        if 'trap_lambda_logit' not in n
+        if 'trap_lambda_logit' not in n and 'router_v2' not in n
     ]
     lambda_params = [
         p for n, p in model.named_parameters()
@@ -283,6 +412,17 @@ def main(args):
         param_dicts.append({"params": lambda_params, "lr": args.lr * 1.0})
         print(f"Using {args.lr * 1.0} learning rate for trap_lambda_logit")
         log_train.info(f"Using {args.lr * 1.0} learning rate for trap_lambda_logit")
+    if router_v2_params:
+        router_lr = args.lr * float(getattr(args, 'asr_router_lr_mult', 1.0))
+        param_dicts.append({"params": router_v2_params, "lr": router_lr})
+        print(
+            f"Using {router_lr} learning rate for router_v2 "
+            f"(mult={getattr(args, 'asr_router_lr_mult', 1.0)})"
+        )
+        log_train.info(
+            f"Using {router_lr} learning rate for router_v2 "
+            f"(mult={getattr(args, 'asr_router_lr_mult', 1.0)})"
+        )
     if args.sgd:
         print('use SGD!')
         optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
@@ -444,6 +584,14 @@ def main(args):
         avg_bal_loss = train_info.get('bal_loss', 0.0)
         print(f"Epoch {epoch} L_bal: {avg_bal_loss:.6f}")
         log_train.info(f"Epoch {epoch} L_bal: {avg_bal_loss:.6f}")
+
+        if 'coverage_loss' in train_info:
+            cover_msg = (
+                f"Epoch {epoch} L_cover: {train_info['coverage_loss']:.6f} "
+                f"(coef_eff={train_info['coverage_coef_eff']:.6f})"
+            )
+            print(cover_msg)
+            log_train.info(cover_msg)
 
         route_w_avgs = train_info.get('route_w_avgs', {})
         if route_w_avgs:
