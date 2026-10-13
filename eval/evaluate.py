@@ -1,8 +1,26 @@
+"""评估指标与评估入口（sigmoid_prob_v1 口径）。
+
+评估测量的对象与训练优化的目标一致：sigmoid(logits) 得到的 [0,1] float
+概率图。预测不做逐图 max 归一化（旧行为会破坏跨图可比性，且在 max<0 时
+翻转像素排序），二值化/阈值扫描均在 [0,1] 概率区间上进行（步长 0.01）。
+GT 为 0/1 二值图，逻辑与旧版一致。
+
+评估输入为内存中的概率数组，不再从 PNG 回读；PNG 仅作可视化存档。
+"""
 import numpy as np
 import os
 import logging
 import glob
 import cv2
+import torch
+
+EVAL_PROTOCOL = 'sigmoid_prob_v1'
+
+
+def sigmoid_prob(logits):
+    """logits → [0,1] float32 概率图（评估口径的唯一入口）。"""
+    return torch.sigmoid(logits).float()
+
 
 def cal_global_acc(pred, gt):
     h,w = gt.shape
@@ -29,8 +47,8 @@ def segment_metrics(pred_list, gt_list, num_cls = 2):
     statistics = []
 
     for pred, gt in zip(pred_list, gt_list):
-        gt_img = (gt / 255).astype('uint8')
-        pred_img = (pred / 255).astype('uint8')
+        gt_img = (gt > 0).astype('uint8')
+        pred_img = (pred > 0.5).astype('uint8')
         global_accuracy_cur.append(cal_global_acc(pred_img, gt_img))
         statistics.append(get_statistics_seg(pred_img, gt_img, num_cls))
 
@@ -50,11 +68,12 @@ def segment_metrics(pred_list, gt_list, num_cls = 2):
     return global_acc, mean_acc, mean_iou_acc
 
 def prf_metrics(pred_list, gt_list):
+    """固定概率阈值 0.5 的 P/R/F1（旧版按各图最大值再归一化，已移除）。"""
     statistics = []
 
     for pred, gt in zip(pred_list, gt_list):
-        gt_img = (gt / 255).astype('uint8')
-        pred_img = (((pred / np.max(pred))>0.5)).astype('uint8')
+        gt_img = (gt > 0).astype('uint8')
+        pred_img = (pred > 0.5).astype('uint8')
         statistics.append(get_statistics_prf(pred_img, gt_img))
 
     tp = np.sum([v[0] for v in statistics])
@@ -72,8 +91,8 @@ def cal_prf_metrics(pred_list, gt_list, thresh_step=0.01):
     for thresh in np.arange(0.0, 1.0, thresh_step):
         statistics = []
         for pred, gt in zip(pred_list, gt_list):
-            gt_img = (gt / 255).astype('uint8')
-            pred_img = (pred / 255 > thresh).astype('uint8')
+            gt_img = (gt > 0).astype('uint8')
+            pred_img = (pred > thresh).astype('uint8')
             statistics.append(get_statistics(pred_img, gt_img))
         tp = np.sum([v[0] for v in statistics])
         fp = np.sum([v[1] for v in statistics])
@@ -104,8 +123,8 @@ def cal_OIS_metrics(pred_list, gt_list, thresh_step=0.01):
         r_acc_list = []
         F1_list = []
         for thresh in np.arange(0.0, 1.0, thresh_step):
-            gt_img = (gt / 255).astype('uint8')
-            pred_img = (pred / 255 > thresh).astype('uint8')
+            gt_img = (gt > 0).astype('uint8')
+            pred_img = (pred > thresh).astype('uint8')
             tp, fp, fn = get_statistics(pred_img, gt_img)
             p_acc = 1.0 if tp == 0 and fp == 0 else tp / (tp + fp)
             if tp + fn == 0:
@@ -139,8 +158,8 @@ def cal_ODS_metrics(pred_list, gt_list, thresh_step=0.01):
     for thresh in np.arange(0.0, 1.0, thresh_step):
         ODS_list = []
         for pred, gt in zip(pred_list, gt_list):
-            gt_img = (gt / 255).astype('uint8')
-            pred_img = (pred / 255 > thresh).astype('uint8')
+            gt_img = (gt > 0).astype('uint8')
+            pred_img = (pred > thresh).astype('uint8')
             tp, fp, fn = get_statistics(pred_img, gt_img)
             # calculate precision
             p_acc = 1.0 if tp == 0 and fp == 0 else tp / (tp + fp)
@@ -159,13 +178,13 @@ def cal_ODS_metrics(pred_list, gt_list, thresh_step=0.01):
     ODS = np.max(np.array(final_ODS))
     return ODS
 
-def cal_mIoU_metrics(pred_list, gt_list, thresh_step=0.01, pred_imgs_names=None, gt_imgs_names=None):
+def cal_mIoU_metrics(pred_list, gt_list, thresh_step=0.01):
     final_iou = []
     for thresh in np.arange(0.0, 1.0, thresh_step):
         iou_list = []
         for i, (pred, gt) in enumerate(zip(pred_list, gt_list)):
-            gt_img = (gt / 255).astype('uint8')
-            pred_img = (pred / 255 > thresh).astype('uint8')
+            gt_img = (gt > 0).astype('uint8')
+            pred_img = (pred > thresh).astype('uint8')
             TP = np.sum((pred_img == 1) & (gt_img == 1))
             TN = np.sum((pred_img == 0) & (gt_img == 0))
             FP = np.sum((pred_img == 1) & (gt_img == 0))
@@ -193,6 +212,12 @@ def imread(path, load_size=0, load_mode=cv2.IMREAD_GRAYSCALE, convert_rgb=False,
     return im
 
 def get_image_pairs(data_dir, suffix_gt='real_B', suffix_pred='fake_B'):
+    """从目录回读 *_pre.png / *_lab.png 对。
+
+    仅供历史存档 PNG 的离线工具（recover_eval_log.py、__main__）使用；
+    训练/评估主链路不经过 PNG 回读。注意：sigmoid_prob_v1 之前存档的
+    *_pre.png 是旧口径（max 归一化 logits），按 /255 解释仅为近似。
+    """
     gt_list = glob.glob(os.path.join(data_dir, '*{}.png'.format(suffix_gt)))
     pred_list = [ll.replace(suffix_gt, suffix_pred) for ll in gt_list]
     assert len(gt_list) == len(pred_list)
@@ -205,20 +230,20 @@ def get_image_pairs(data_dir, suffix_gt='real_B', suffix_pred='fake_B'):
         gt_imgs_names.append(gt_path)
     return pred_imgs, gt_imgs, pred_imgs_names, gt_imgs_names
 
-def eval(log_eval, results_dir, epoch):
+def eval(log_eval, pred_list, gt_list, epoch):
+    """对内存中的概率图（[0,1] float）与 0/1 GT 计算全部指标并写日志。
 
-    suffix_gt = "lab"
-    suffix_pred = "pre"
-    log_eval.info(results_dir)
-    log_eval.info("checkpoints -> " + results_dir)
-    src_img_list, tgt_img_list, pred_imgs_names, gt_imgs_names = get_image_pairs(results_dir, suffix_gt, suffix_pred)
-    assert len(src_img_list) == len(tgt_img_list)
-    final_accuracy_all = cal_prf_metrics(src_img_list, tgt_img_list)
+    日志 key 与旧版逐字一致（mIouU/ODS/OIS/F1/P/R），仅在头部新增一行
+    eval protocol -> sigmoid_prob_v1 用于与历史日志区分。
+    """
+    assert len(pred_list) == len(gt_list)
+    log_eval.info("eval protocol -> " + EVAL_PROTOCOL)
+    final_accuracy_all = cal_prf_metrics(pred_list, gt_list)
     final_accuracy_all = np.array(final_accuracy_all)
     Precision_list, Recall_list, F_list = final_accuracy_all[:, 1], final_accuracy_all[:,2], final_accuracy_all[:, 3]
-    mIoU = cal_mIoU_metrics(src_img_list, tgt_img_list, pred_imgs_names=pred_imgs_names, gt_imgs_names=gt_imgs_names)
-    ODS = cal_ODS_metrics(src_img_list, tgt_img_list)
-    OIS = cal_OIS_metrics(src_img_list, tgt_img_list)
+    mIoU = cal_mIoU_metrics(pred_list, gt_list)
+    ODS = cal_ODS_metrics(pred_list, gt_list)
+    OIS = cal_OIS_metrics(pred_list, gt_list)
     log_eval.info("mIouU -> " + str(mIoU))
     log_eval.info("ODS -> " + str(ODS))
     log_eval.info("OIS -> " + str(OIS))
@@ -236,12 +261,14 @@ if __name__ == '__main__':
     logging.info(results_dir)
     src_img_list, tgt_img_list, pred_imgs_names, gt_imgs_names = get_image_pairs(results_dir, suffix_gt, suffix_pred)
     assert len(src_img_list) == len(tgt_img_list)
-    final_accuracy_all = cal_prf_metrics(src_img_list, tgt_img_list)
+    pred_list = [(p / 255.0).astype(np.float32) for p in src_img_list]
+    gt_list = [(g > 0).astype('uint8') for g in tgt_img_list]
+    final_accuracy_all = cal_prf_metrics(pred_list, gt_list)
     final_accuracy_all = np.array(final_accuracy_all)
     Precision_list, Recall_list, F_list = final_accuracy_all[:,1], final_accuracy_all[:,2], final_accuracy_all[:,3]
-    mIoU = cal_mIoU_metrics(src_img_list,tgt_img_list, pred_imgs_names=pred_imgs_names, gt_imgs_names=gt_imgs_names)
-    ODS = cal_ODS_metrics(src_img_list, tgt_img_list)
-    OIS = cal_OIS_metrics(src_img_list, tgt_img_list)
+    mIoU = cal_mIoU_metrics(pred_list, gt_list)
+    ODS = cal_ODS_metrics(pred_list, gt_list)
+    OIS = cal_OIS_metrics(pred_list, gt_list)
     print("mIouU -> " + str(mIoU))
     print("ODS -> " + str(ODS))
     print("OIS -> " + str(OIS))
@@ -249,7 +276,3 @@ if __name__ == '__main__':
     print("P -> " + str(Precision_list[0]))
     print("R -> " + str(Recall_list[0]))
     print("eval finish!")
-
-
-    
-

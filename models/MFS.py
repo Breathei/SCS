@@ -28,7 +28,7 @@ class MFS(nn.Module):
         self.linear_c2 = MLP(input_dim=32, embed_dim=embedding_dim)
         self.linear_c1 = MLP(input_dim=16, embed_dim=embedding_dim)
         self.GBC_C = GBC(embedding_dim*4)
-        self.GBC_8 = GBC(8, norm_type='IN')
+        self.GBC_8 = GBC(embedding_dim, norm_type='IN')
         self.GN_C = nn.GroupNorm(num_channels=embedding_dim*4, num_groups=embedding_dim*4//16)
         self.linear_fuse = BottConv(embedding_dim*4, embedding_dim, embedding_dim//8, kernel_size=1, padding=0, stride=1)
 
@@ -40,7 +40,7 @@ class MFS(nn.Module):
         self.DySample_C_4 = DySample(embedding_dim, scale=4)
         self.DySample_C_8 = DySample(embedding_dim, scale=8)
 
-    def forward(self, inputs):
+    def forward(self, inputs, return_feat=False):
         c4, c3, c2, c1 = inputs
         b, c, h, w = c4.shape
         out_c4 = self.linear_c4(c4.reshape(b, c, h*w).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, self.embedding_dim, h, w)
@@ -60,7 +60,21 @@ class MFS(nn.Module):
         out_c = self.GBC_C(torch.cat([out_c4, out_c3, out_c2, out_c1], dim=1))
         out_c = self.linear_fuse(out_c)
 
+        if return_feat:
+            # detail branch 融合用：linear_fuse 输出、dropout/linear_pred 之前。
+            return out_c
+
         out_c = self.dropout(out_c)
         x = self.linear_pred_1(self.linear_pred(out_c))
 
         return x
+
+    def predict(self, feat):
+        """从 (可能经过外部融合的) embedding_dim 通道特征生成 logits。
+
+        默认路径（detail branch 关闭）不走这里；开启时 Decoder 把
+        concat→1x1 融合后的特征送入，dropout/linear_pred/linear_pred_1
+        与默认路径同一组模块、同一调用顺序。
+        """
+        feat = self.dropout(feat)
+        return self.linear_pred_1(self.linear_pred(feat))

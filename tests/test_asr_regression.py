@@ -73,8 +73,11 @@ def main():
             if out.max() > 0:
                 out = 255 * (out / out.max())
 
-            preds.append(out)
-            gts.append(target)
+            # cal_mIoU_metrics 现接收 [0,1] 概率。本测试冻结旧导出口径
+            # （逐图 max 归一化）以保持与 baseline_deepcrack.json 可比，
+            # 仅在调用前把 0-255 数组换算到 [0,1]，数值与旧调用完全一致。
+            preds.append(out / 255.0)
+            gts.append(target / 255.0)
 
     miou = cal_mIoU_metrics(preds, gts)
     print(f"mIoU = {miou:.6f}")

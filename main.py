@@ -17,10 +17,62 @@ from engine import train_one_epoch, ModelEMA
 from models import build_model
 from datasets import create_dataset
 import cv2
-from eval.evaluate import eval
+from eval.evaluate import eval, sigmoid_prob
 from util.logger import get_logger
 from tqdm import tqdm
 from mmengine.optim.scheduler.lr_scheduler import PolyLR
+
+
+class DualBestTracker:
+    """raw/EMA 双轨 best 追踪与覆盖式保存（选择指标硬编码为 mIoU）。
+
+    每条轨只用自己的指标序列做 argmax，互不污染；出现新 best 时原地覆盖
+    `{ckpt_stem}_best_{raw|ema}.pth`（磁盘占用 O(1)），与逐 epoch 全量存档
+    并存。use_ema=False 时训练循环只喂 raw 轨，ema 轨自然不产生任何文件。
+    best 文件的 'model' key 保存调用时刻的 model.state_dict()——raw 轨在
+    EMA apply 之前调用，ema 轨在 shadow 权重 apply 之后、restore 之前调用，
+    因此 best_ema.pth 可被独立 test 脚本直接 strict-load。
+    """
+
+    def __init__(self, output_dir, ckpt_stem, logger=None):
+        self.output_dir = Path(output_dir)
+        self.ckpt_stem = ckpt_stem
+        self.logger = logger
+        self.state = {
+            'raw': {'mIoU': float('-inf'), 'epoch': -1, 'metrics': None},
+            'ema': {'mIoU': float('-inf'), 'epoch': -1, 'metrics': None},
+        }
+
+    def best_path(self, tag):
+        return self.output_dir / f'{self.ckpt_stem}_best_{tag}.pth'
+
+    def maybe_update(self, tag, metrics, epoch, model, args):
+        """若该轨出现新 best 则覆盖保存并记录日志，返回是否刷新。"""
+        assert tag in self.state, f'unknown track: {tag}'
+        miou = metrics['mIoU']
+        if miou <= self.state[tag]['mIoU']:
+            return False
+        self.state[tag] = {'mIoU': miou, 'epoch': epoch, 'metrics': metrics}
+        path = self.best_path(tag)
+        save_dict = {
+            'model': model.state_dict(),
+            'epoch': epoch,
+            'args': args,
+            'best_metric': miou,
+        }
+        utils.save_on_master(save_dict, path)
+        msg = f"new {tag}-best mIoU={miou} at epoch {epoch} -> {path}"
+        print(msg)
+        if self.logger is not None:
+            self.logger.info(msg)
+        return True
+
+    def track_lines(self, tag):
+        """该轨的 max 摘要行（保持 max_mIoU -> X / max Epoch -> N 风格）。"""
+        st = self.state[tag]
+        if st['epoch'] < 0:
+            return None
+        return f"[{tag}] max_mIoU -> {st['mIoU']}\n[{tag}] max Epoch -> {st['epoch']}"
 
 
 def sanitize_checkpoint_state_dict(state_dict, model, scan_routing='none', logger=None):
@@ -130,6 +182,10 @@ def get_args_parser():
                         help='Weight ratio for Binary Cross Entropy Loss (0.0-1.0), should sum to 1 with DiceLoss_ratio')
     parser.add_argument('--DiceLoss_ratio', default=0.17, type=float,
                         help='Weight ratio for Dice Loss (0.0-1.0), should sum to 1 with BCELoss_ratio')
+    parser.add_argument('--mfs_channels', default=8, type=int,
+                        help='Channel width of the MFS decoder head (default 8 keeps legacy behavior)')
+    parser.add_argument('--detail_branch', action='store_true',
+                        help='Enable the high-resolution detail branch fused before the prediction head (default off)')
     parser.add_argument('--Norm_Type', default='GN', type=str,
                         help='Normalization layer type [GN|BN], GN=GroupNorm')
     parser.add_argument('--dataset_path', default="./Dataset/TUT",
@@ -333,6 +389,7 @@ def main(args):
         f"trap_lambda={args.trap_lambda}, use_ema={args.use_ema}, "
         f"boundary_alpha={args.boundary_alpha}, boundary_tau={args.boundary_tau}, "
         f"strong_aug={args.strong_aug}, skel_loss_coef={args.skel_loss_coef}, "
+        f"mfs_channels={args.mfs_channels}, detail_branch={args.detail_branch}, "
         f"batch_size={args.batch_size}, lr={args.lr}, seed={args.seed}"
     )
     if args.scan_routing == 'asr_scan_v2':
@@ -472,11 +529,16 @@ def main(args):
     print("Start processing! ")
     log_train.info("Start processing! ")
     start_time = time.time()
-    max_mIoU = 0
-    max_Metrics = {'epoch': 0, 'mIoU': 0, 'ODS': 0, 'OIS': 0, 'F1': 0, 'Precision': 0, 'Recall': 0}
+    # raw/EMA 双轨 best：各自独立 argmax（指标硬编码 mIoU）、覆盖式保存。
+    ckpt_stem = run_name.replace('Dataset->', '')
+    best_tracker = DualBestTracker(output_dir, ckpt_stem, logger=log_train)
 
     def run_evaluation(epoch, save_root, tag=''):
-        """在 test 集上前向一遍（写出 PNG），并用官方阈值扫描计算指标，返回 metrics。
+        """在 test 集上前向一遍，并用官方阈值扫描计算指标，返回 metrics。
+
+        评估口径 sigmoid_prob_v1：sigmoid 概率（float32，[0,1]）在内存中
+        直接传给评估函数；*_pre.png 仍写盘（255*prob 转 uint8），仅作可视化
+        存档，不再作为指标来源。
 
         tag 非空时在日志里标记权重组别（'raw'/'ema'），用于区分两组评估指标；
         tag='' 时输出与旧版逐字节一致（EMA 关闭时走此路径）。
@@ -489,6 +551,7 @@ def main(args):
 
         if not os.path.isdir(save_root):
             os.makedirs(save_root)
+        pred_list, gt_list = [], []
         with torch.no_grad():
             model.eval()
             for batch_idx, (data) in enumerate(test_dl):
@@ -496,23 +559,23 @@ def main(args):
                 target = data["label"].to(device=device, dtype=torch.int64)
                 out = model(x)
                 loss = criterion(out, target.float())
-                target = target[0, 0, ...].cpu().numpy()
-                out = out[0, 0, ...].cpu().numpy()
+                prob = sigmoid_prob(out[0, 0]).cpu().numpy()
+                target01 = target[0, 0].cpu().numpy().astype(np.uint8)
                 root_name = data["A_paths"][0].split("/")[-1][0:-4]
+                pred_list.append(prob)
+                gt_list.append(target01)
 
-                target = 255 * (target / np.max(target))
-                out = 255 * (out / np.max(out))
-
-                # out[out >= 0.5] = 255
-                # out[out < 0.5] = 0
+                # GT 侧保持现有行为；PNG 仅为可视化存档。
+                target_png = 255 * (target01 / np.max(target01))
+                out_png = (255 * prob).astype(np.uint8)
 
                 log_test.info('----------------------------------------------------------------------------------------------')
                 log_test.info("loss -> " + str(loss))
                 log_test.info(str(os.path.join(save_root, "{}_lab.png".format(root_name))))
                 log_test.info(str(os.path.join(save_root, "{}_pre.png".format(root_name))))
                 log_test.info('----------------------------------------------------------------------------------------------')
-                cv2.imwrite(os.path.join(save_root, "{}_lab.png".format(root_name)), target)
-                cv2.imwrite(os.path.join(save_root, "{}_pre.png".format(root_name)), out)
+                cv2.imwrite(os.path.join(save_root, "{}_lab.png".format(root_name)), target_png)
+                cv2.imwrite(os.path.join(save_root, "{}_pre.png".format(root_name)), out_png)
                 pbar.set_description(f"Loss: {loss.item():.4f}")
                 pbar.update(1)
         pbar.close()
@@ -525,7 +588,7 @@ def main(args):
         print(f"evalauting epoch start ->  {epoch}{suffix}")
         if tag:
             log_eval.info(f"===== [{tag}] weights eval, epoch {epoch} =====")
-        metrics = eval(log_eval, save_root, epoch)
+        metrics = eval(log_eval, pred_list, gt_list, epoch)
         for key, value in metrics.items():
             print(str(key) + ' -> ' + str(value))
         return metrics
@@ -538,7 +601,6 @@ def main(args):
         if args.output_dir:
             # Checkpoint filename stem: date + time + dataset_name (without the
             # legacy "Dataset->" separator that is kept in the run folder name).
-            ckpt_stem = run_name.replace('Dataset->', '')
             checkpoint_paths = [output_dir / f'{ckpt_stem}.pth']
             if (epoch + 1) % 1 == 0:
                 checkpoint_paths.append(output_dir / f'{ckpt_stem}_epoch{epoch}.pth')
@@ -612,10 +674,15 @@ def main(args):
         save_root = f'./results/{results_path}/results_' + str(epoch)
         # 开 EMA 时每个 epoch 评估两组权重：raw（训练权重，路径与旧行为一致）
         # 和 ema（shadow 权重；评估完立即切回训练权重继续训练）。
+        # best 双轨独立追踪：raw 轨在 EMA apply 前保存（model 为 raw 权重），
+        # ema 轨在 apply 后、restore 前保存（model 为 shadow 权重，可独立
+        # strict-load）；两条轨的 argmax 互不干扰。
         metrics = run_evaluation(epoch, save_root, tag='raw' if model_ema is not None else '')
+        best_tracker.maybe_update('raw', metrics, epoch, model, args)
         if model_ema is not None:
             backup = model_ema.apply_to(model)
             metrics_ema = run_evaluation(epoch, save_root + '_ema', tag='ema')
+            best_tracker.maybe_update('ema', metrics_ema, epoch, model, args)
             model_ema.restore(model, backup)
             ema_summary = (
                 f"epoch {epoch} eval summary -> "
@@ -626,36 +693,26 @@ def main(args):
             )
             print(ema_summary)
             log_eval.info(ema_summary)
-        if(max_mIoU < metrics['mIoU']):
-            max_Metrics = metrics
-            max_mIoU = metrics['mIoU']
-            ckpt_stem = run_name.replace('Dataset->', '')
-            checkpoint_paths = [output_dir / f'{ckpt_stem}_best.pth']
-            for checkpoint_path in checkpoint_paths:
-                save_dict = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }
-                if model_ema is not None:
-                    save_dict['model_ema'] = model_ema.state_dict()
-                utils.save_on_master(save_dict, checkpoint_path)
-            log_train.info("\nupdate and save best model -> " + str(epoch))
-            print("\nupdate and save best model -> ", epoch)
 
         print("evalauting epoch finish -> ", epoch)
-        print('\nmax_mIoU -> ' + str(max_Metrics['mIoU']) + '\nmax Epoch -> ' + str(max_Metrics['epoch']))
+        for tag in ('raw', 'ema'):
+            lines = best_tracker.track_lines(tag)
+            if lines is None:
+                continue
+            print('\n' + lines)
+            log_eval.info('\n' + lines)
         print("---------------------------------------------------------------------------------------")
 
         log_eval.info("evalauting epoch finish -> " + str(epoch))
-        log_eval.info('\nmax_mIoU -> ' + str(max_Metrics['mIoU']) + '\nmax Epoch -> ' + str(max_Metrics['epoch']))
         log_eval.info("---------------------------------------------------------------------------------------")
 
-    for key, value in max_Metrics.items():
-        log_eval.info(str(key) + ' -> ' + str(value))
-    log_eval.info('\nmax_mIoU -> ' + str(max_Metrics['mIoU']) + '\nmax Epoch -> ' + str(max_Metrics['epoch']))
+    for tag in ('raw', 'ema'):
+        st = best_tracker.state[tag]
+        if st['epoch'] < 0:
+            continue
+        for key, value in st['metrics'].items():
+            log_eval.info(f"[{tag}] " + str(key) + ' -> ' + str(value))
+        log_eval.info('\n' + best_tracker.track_lines(tag))
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

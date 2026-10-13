@@ -2,20 +2,24 @@
 恢复被截断的 eval.log。
 
 原理：每个 epoch 的预测图保存在 ./results/<run>/results_<epoch>/ 下，
-eval() 只读取这些 png（不需要模型），因此可以对历史 epoch 重新计算指标，
-并按 main.py 原有的日志格式补写回 eval.log。
+这里负责回读这些 png（不需要模型），换算为 sigmoid_prob_v1 口径后重新
+计算指标，并按 main.py 原有的日志格式补写回 eval.log。
+
+注意：sigmoid_prob_v1 之前存档的 *_pre.png 是旧口径（逐图 max 归一化的
+logits），按 /255 解释为概率只是近似，恢复出的数字与原始旧日志不可比；
+补写行的 asctime 时间戳是恢复执行时间，不是原始训练时间。
 
 用法（在项目根目录执行）：
     python recover_eval_log.py \
         --results_root "./results/2026_09_20_13:57:17_Dataset->Crack500" \
         --eval_log "./checkpoints/2026_09_20_13:57:17_Dataset->Crack500/eval.log" \
         --start_epoch 0 --end_epoch 26
-
-注意：补写行的 asctime 时间戳是恢复执行时间，不是原始训练时间。
 """
 import argparse
 
-from eval.evaluate import eval
+import numpy as np
+
+from eval.evaluate import eval, get_image_pairs
 from util.logger import get_logger
 
 
@@ -46,7 +50,10 @@ def main():
     for epoch in range(args.start_epoch, args.end_epoch + 1):
         save_root = f'{args.results_root}/results_{epoch}'
         print(f'recovering epoch {epoch}: {save_root}', flush=True)
-        metrics = eval(log_eval, save_root, epoch)
+        src_img_list, tgt_img_list, _, _ = get_image_pairs(save_root, 'lab', 'pre')
+        pred_list = [(p / 255.0).astype(np.float32) for p in src_img_list]
+        gt_list = [(g > 0).astype(np.uint8) for g in tgt_img_list]
+        metrics = eval(log_eval, pred_list, gt_list, epoch)
         if max_mIoU < metrics['mIoU']:
             max_mIoU = metrics['mIoU']
             max_epoch = epoch

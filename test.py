@@ -13,6 +13,7 @@ import util.misc as utils
 from datasets import create_dataset
 from models import build_model
 from main import get_args_parser, sanitize_checkpoint_state_dict
+from eval.evaluate import sigmoid_prob
 
 parser = argparse.ArgumentParser('SCSEGAMBA FOR CRACK', parents=[get_args_parser()])
 args = parser.parse_args()
@@ -49,13 +50,11 @@ if __name__ == '__main__':
             out = model(x)
 
             target = target[0, 0, ...].cpu().numpy()
-            out = out[0, 0, ...].cpu().numpy()
+            # sigmoid_prob_v1：导出口径与训练/评估一致，概率图不做 max 归一化。
+            prob = sigmoid_prob(out[0, 0]).cpu().numpy()
             root_name = data["A_paths"][0].split("/")[-1][0:-4]
             target = 255 * (target / np.max(target))
-            out = 255 * (out / np.max(out))
-
-            # out[out >= 0.5] = 255
-            # out[out < 0.5] = 0
+            out = (255 * prob).astype(np.uint8)
 
             print('----------------------------------------------------------------------------------------------')
             print(os.path.join(save_root, "{}_lab.png".format(root_name)))

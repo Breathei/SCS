@@ -9,19 +9,44 @@ from torch import nn
 import torch.nn.functional as F
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS import SAVSS
 from models.MFS import MFS
+from models.detail_branch import DetailBranch
 
 class Decoder(nn.Module):
     def __init__(self, backbone, args=None):
         super().__init__()
         self.args = args
         self.backbone = backbone
-        self.MFS = MFS(8)
+        self.mfs_channels = getattr(args, 'mfs_channels', 8)
+        self.MFS = MFS(self.mfs_channels)
+        # 高分辨率细节支路（实验选项，默认关闭）。关闭时不创建任何模块，
+        # state_dict 与默认配置完全一致。
+        self.use_detail_branch = bool(getattr(args, 'detail_branch', False))
+        self.detail_branch = None
+        self.detail_fuse = None
+        if self.use_detail_branch:
+            self.detail_branch = DetailBranch()
+            # concat([mfs_feat(C), detail(16)]) → 1x1(C+16 → C)。
+            # 初始化：前 C 个输入通道恒等、detail 通道与 bias 置零——
+            # detail 有效贡献从零开始，初始前向与关闭时逐 bit 一致，
+            # 且 detail 通路权重第一步即获得非零梯度。
+            self.detail_fuse = nn.Conv2d(self.mfs_channels + 16,
+                                         self.mfs_channels, kernel_size=1)
+            nn.init.zeros_(self.detail_fuse.weight)
+            nn.init.zeros_(self.detail_fuse.bias)
+            with torch.no_grad():
+                for i in range(self.mfs_channels):
+                    self.detail_fuse.weight[i, i, 0, 0] = 1.0
 
     def forward(self, samples):
         outs_SAVSS = self.backbone(samples)
-        out = self.MFS(outs_SAVSS)
-
-        return out
+        if self.detail_branch is None:
+            return self.MFS(outs_SAVSS)
+        mfs_feat = self.MFS(outs_SAVSS, return_feat=True)
+        detail = self.detail_branch(samples)
+        detail = F.interpolate(detail, size=mfs_feat.shape[-2:],
+                               mode='bilinear', align_corners=False)
+        fused = self.detail_fuse(torch.cat([mfs_feat, detail], dim=1))
+        return self.MFS.predict(fused)
 
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1., dims=(-2, -1)):
