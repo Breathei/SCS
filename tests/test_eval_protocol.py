@@ -97,6 +97,40 @@ class TestEvalProtocol(unittest.TestCase):
         for key in ('mIoU', 'ODS', 'OIS', 'F1', 'Precision', 'Recall'):
             self.assertEqual(m1[key], m2[key], key)
 
+    def test_f1_pr_reported_at_best_threshold(self):
+        # F1/P/R 三行必须取 micro-F1 最优阈值行（argmax），而不是退化
+        # 的 thresh=0 行（sigmoid 口径下该行恒为 R=1、P=前景占比）。
+        # 构造确定性数据：背景概率均匀分布于 [0,0.4]，前景 70% 为 0.8、
+        # 30% 为 0.2——最优阈值约 0.5（R=0.7, P=1），thresh=0 行退化。
+        from eval.evaluate import cal_prf_metrics
+        rng = np.random.RandomState(0)
+        pred_list, gt_list = [], []
+        for i in range(3):
+            gt = np.zeros((64, 64), dtype=np.uint8)
+            rr = np.arange(64)
+            gt[rr, (rr + i) % 64] = 1
+            gt[rr, (rr + i + 1) % 64] = 1
+            prob = np.linspace(0.0, 0.4, 64 * 64,
+                               dtype=np.float32).reshape(64, 64)
+            fg = gt.astype(bool)
+            fg_probs = np.where(rng.rand(fg.sum()) < 0.7, 0.8, 0.2)
+            prob[fg] = fg_probs.astype(np.float32)
+            pred_list.append(prob)
+            gt_list.append(gt)
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = eval(_make_logger(os.path.join(tmp, 'eval.log')),
+                           pred_list, gt_list, 0)
+        table = np.array(cal_prf_metrics(pred_list, gt_list))
+        best_idx = int(np.argmax(table[:, 3]))
+        # thresh=0 行确实是退化的（构造前提），argmax 行不应落在那里。
+        self.assertAlmostEqual(float(table[0, 2]), 1.0, places=7)
+        self.assertGreater(best_idx, 0)
+        self.assertAlmostEqual(metrics['F1'], float(table[best_idx, 3]), places=7)
+        self.assertAlmostEqual(metrics['Precision'], float(table[best_idx, 1]), places=7)
+        self.assertAlmostEqual(metrics['Recall'], float(table[best_idx, 2]), places=7)
+        self.assertLess(metrics['Recall'], 1.0)
+        self.assertGreater(metrics['F1'], float(table[0, 3]))
+
     def test_end_to_end_small_sample_and_log_format(self):
         # e) 端到端小样本：完整 eval 流程，指标在 [0,1]、无 NaN，
         #    日志 key 与旧版一致且含 protocol 头行。

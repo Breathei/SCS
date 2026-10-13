@@ -235,24 +235,30 @@ def eval(log_eval, pred_list, gt_list, epoch):
 
     日志 key 与旧版逐字一致（mIouU/ODS/OIS/F1/P/R），仅在头部新增一行
     eval protocol -> sigmoid_prob_v1 用于与历史日志区分。
+
+    F1/P/R 三行报告 micro-F1 最优阈值所在行（argmax），而不是阈值扫描表
+    第 0 行（thresh=0.0）：sigmoid 口径下 prob>0 全图为前景，第 0 行恒为
+    R=1、P=前景占比的退化值。micro 聚合与 ODS（per-image 宏平均）接近但
+    不完全相等，作为 P/R 工作点报告使用。
     """
     assert len(pred_list) == len(gt_list)
     log_eval.info("eval protocol -> " + EVAL_PROTOCOL)
     final_accuracy_all = cal_prf_metrics(pred_list, gt_list)
     final_accuracy_all = np.array(final_accuracy_all)
     Precision_list, Recall_list, F_list = final_accuracy_all[:, 1], final_accuracy_all[:,2], final_accuracy_all[:, 3]
+    best_idx = int(np.argmax(F_list))
     mIoU = cal_mIoU_metrics(pred_list, gt_list)
     ODS = cal_ODS_metrics(pred_list, gt_list)
     OIS = cal_OIS_metrics(pred_list, gt_list)
     log_eval.info("mIouU -> " + str(mIoU))
     log_eval.info("ODS -> " + str(ODS))
     log_eval.info("OIS -> " + str(OIS))
-    log_eval.info("F1 -> " + str(F_list[0]))
-    log_eval.info("P -> " + str(Precision_list[0]))
-    log_eval.info("R -> " + str(Recall_list[0]))
+    log_eval.info("F1 -> " + str(F_list[best_idx]))
+    log_eval.info("P -> " + str(Precision_list[best_idx]))
+    log_eval.info("R -> " + str(Recall_list[best_idx]))
     log_eval.info("eval finish!")
 
-    return {'epoch': epoch, 'mIoU': mIoU, 'ODS': ODS, 'OIS': OIS, 'F1': F_list[0], 'Precision': Precision_list[0], 'Recall': Recall_list[0]}
+    return {'epoch': epoch, 'mIoU': mIoU, 'ODS': ODS, 'OIS': OIS, 'F1': F_list[best_idx], 'Precision': Precision_list[best_idx], 'Recall': Recall_list[best_idx]}
 
 if __name__ == '__main__':
     suffix_gt = "lab"
@@ -266,13 +272,14 @@ if __name__ == '__main__':
     final_accuracy_all = cal_prf_metrics(pred_list, gt_list)
     final_accuracy_all = np.array(final_accuracy_all)
     Precision_list, Recall_list, F_list = final_accuracy_all[:,1], final_accuracy_all[:,2], final_accuracy_all[:,3]
+    best_idx = int(np.argmax(F_list))
     mIoU = cal_mIoU_metrics(pred_list, gt_list)
     ODS = cal_ODS_metrics(pred_list, gt_list)
     OIS = cal_OIS_metrics(pred_list, gt_list)
     print("mIouU -> " + str(mIoU))
     print("ODS -> " + str(ODS))
     print("OIS -> " + str(OIS))
-    print("F1 -> " + str(F_list[0]))
-    print("P -> " + str(Precision_list[0]))
-    print("R -> " + str(Recall_list[0]))
+    print("F1 -> " + str(F_list[best_idx]))
+    print("P -> " + str(Precision_list[best_idx]))
+    print("R -> " + str(Recall_list[best_idx]))
     print("eval finish!")
