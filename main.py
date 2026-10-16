@@ -186,6 +186,12 @@ def get_args_parser():
                         help='Channel width of the MFS decoder head (default 8 keeps legacy behavior)')
     parser.add_argument('--detail_branch', action='store_true',
                         help='Enable the high-resolution detail branch fused before the prediction head (default off)')
+    parser.add_argument('--num_scans', default=4, type=int, choices=[1, 2, 4],
+                        help='Number of serpentine scan paths kept per SAVSS block, in the fixed order '
+                             '[horizontal, vertical, main-diagonal, anti-diagonal] (default 4 = original)')
+    parser.add_argument('--degconv', action='store_true',
+                        help='Enable DEGConv (direction-guided edge-gated convolution) on each of the '
+                             '4 stage outputs before the MFS head (default off)')
     parser.add_argument('--Norm_Type', default='GN', type=str,
                         help='Normalization layer type [GN|BN], GN=GroupNorm')
     parser.add_argument('--dataset_path', default="./Dataset/TUT",
@@ -390,6 +396,7 @@ def main(args):
         f"boundary_alpha={args.boundary_alpha}, boundary_tau={args.boundary_tau}, "
         f"strong_aug={args.strong_aug}, skel_loss_coef={args.skel_loss_coef}, "
         f"mfs_channels={args.mfs_channels}, detail_branch={args.detail_branch}, "
+        f"num_scans={args.num_scans}, degconv={args.degconv}, "
         f"batch_size={args.batch_size}, lr={args.lr}, seed={args.seed}"
     )
     if args.scan_routing == 'asr_scan_v2':

@@ -88,6 +88,7 @@ class SAVSS_2D(nn.Module):
             asr_beta=0.1,
             asr_route_grid=1,
             asr_v2_beta=0.25,
+            num_scans=4,
     ):
         super().__init__()
         # 保存状态空间模型超参数。
@@ -120,6 +121,17 @@ class SAVSS_2D(nn.Module):
         self.asr_v2_beta = float(asr_v2_beta)
         assert 0.0 <= self.asr_v2_beta <= 1.0, \
             f"asr_v2_beta must be in [0, 1], got {self.asr_v2_beta}"
+
+        # 扫描剪枝：只保留 sass() 固定语义顺序 [横, 纵, 主对角, 副对角] 的
+        # 前 num_scans 条路径；被剪掉的路径不生成排列、不做 SSM 前向、
+        # 不参与融合。默认 4 与原实现逐 bit 一致。
+        self.num_scans = int(num_scans)
+        assert self.num_scans in (1, 2, 4), \
+            f"num_scans must be one of (1, 2, 4), got {self.num_scans}"
+        if self.scan_routing != 'none':
+            # 路由融合的 4 路权重/分支索引按 4 条扫描设计，剪枝组合未定义。
+            assert self.num_scans == 4, \
+                f"scan_routing={self.scan_routing} requires num_scans=4"
 
         self.discretization = discretization
         assert self.discretization in (
@@ -256,8 +268,10 @@ class SAVSS_2D(nn.Module):
             return selective_scan_euler_pytorch_fn
 
     # sass = Self-Adaptive Scan Sequence
-    # 根据当前 (H, W) 生成 4 条蛇形扫描序列及其逆序，用于把 2D token 展平成 1D。
-    def sass(self, hw_shape):
+    # 根据当前 (H, W) 生成蛇形扫描序列及其逆序，用于把 2D token 展平成 1D。
+    # n_dirs 控制只生成固定语义顺序 [横, 纵, 主对角, 副对角] 的前 n_dirs 条
+    # （扫描剪枝：被剪掉的方向连排列都不生成）；默认 4 与原行为完全一致。
+    def sass(self, hw_shape, n_dirs=4):
         H, W = hw_shape
         L = H * W
         o1, o2, o3, o4 = [], [], [], []
@@ -299,75 +313,80 @@ class SAVSS_2D(nn.Module):
         d1 = [0] + d1[:-1]
 
         # 方向 2：纵向蛇形扫描（从左上角开始上下往返）。
-        i, j = 0, 0
-        i_d = "down"
-        while j < W:
-            assert i_d in ["down", "up"]
-            idx = i * W + j
-            o2_inverse[idx] = len(o2)
-            o2.append(idx)
-            if i_d == "down":
-                if i < H - 1:
-                    i = i + 1
-                    d2.append(4)
+        if n_dirs >= 2:
+            i, j = 0, 0
+            i_d = "down"
+            while j < W:
+                assert i_d in ["down", "up"]
+                idx = i * W + j
+                o2_inverse[idx] = len(o2)
+                o2.append(idx)
+                if i_d == "down":
+                    if i < H - 1:
+                        i = i + 1
+                        d2.append(4)
+                    else:
+                        j = j + 1
+                        d2.append(1)
+                        i_d = "up"
                 else:
-                    j = j + 1
-                    d2.append(1)
-                    i_d = "up"
-            else:
-                if i > 0:
-                    i = i - 1
-                    d2.append(3)
-                else:
-                    j = j + 1
-                    d2.append(1)
-                    i_d = "down"
-        d2 = [0] + d2[:-1]
+                    if i > 0:
+                        i = i - 1
+                        d2.append(3)
+                    else:
+                        j = j + 1
+                        d2.append(1)
+                        i_d = "down"
+            d2 = [0] + d2[:-1]
 
         # 方向 3：主对角线蛇形扫描（沿 \ 方向对角线往返）。
-        for diag in range(H + W - 1):
-            if diag % 2 == 0:
-                for i in range(min(diag + 1, H)):
-                    j = diag - i
-                    if j < W:
-                        idx = i * W + j
-                        o3.append(idx)
-                        o3_inverse[idx] = len(o3) - 1
-                        d3.append(1 if j == diag else 4)
-            else:
-                for j in range(min(diag + 1, W)):
-                    i = diag - j
-                    if i < H:
-                        idx = i * W + j
-                        o3.append(idx)
-                        o3_inverse[idx] = len(o3) - 1
-                        d3.append(4 if i == diag else 1)
-        d3 = [0] + d3[:-1]
+        if n_dirs >= 3:
+            for diag in range(H + W - 1):
+                if diag % 2 == 0:
+                    for i in range(min(diag + 1, H)):
+                        j = diag - i
+                        if j < W:
+                            idx = i * W + j
+                            o3.append(idx)
+                            o3_inverse[idx] = len(o3) - 1
+                            d3.append(1 if j == diag else 4)
+                else:
+                    for j in range(min(diag + 1, W)):
+                        i = diag - j
+                        if i < H:
+                            idx = i * W + j
+                            o3.append(idx)
+                            o3_inverse[idx] = len(o3) - 1
+                            d3.append(4 if i == diag else 1)
+            d3 = [0] + d3[:-1]
 
         # 方向 4：反对角线蛇形扫描（沿 / 方向对角线往返，列做镜像）。
-        for diag in range(H + W - 1):
-            if diag % 2 == 0:
-                for i in range(min(diag + 1, H)):
-                    j = diag - i
-                    if j < W:
-                        idx = i * W + (W - j - 1)
-                        o4.append(idx)
-                        o4_inverse[idx] = len(o4) - 1
-                        d4.append(1 if j == diag else 4)
-            else:
-                for j in range(min(diag + 1, W)):
-                    i = diag - j
-                    if i < H:
-                        idx = i * W + (W - j - 1)
-                        o4.append(idx)
-                        o4_inverse[idx] = len(o4) - 1
-                        d4.append(4 if i == diag else 1)
-        d4 = [0] + d4[:-1]
+        if n_dirs >= 4:
+            for diag in range(H + W - 1):
+                if diag % 2 == 0:
+                    for i in range(min(diag + 1, H)):
+                        j = diag - i
+                        if j < W:
+                            idx = i * W + (W - j - 1)
+                            o4.append(idx)
+                            o4_inverse[idx] = len(o4) - 1
+                            d4.append(1 if j == diag else 4)
+                else:
+                    for j in range(min(diag + 1, W)):
+                        i = diag - j
+                        if i < H:
+                            idx = i * W + (W - j - 1)
+                            o4.append(idx)
+                            o4_inverse[idx] = len(o4) - 1
+                            d4.append(4 if i == diag else 1)
+            d4 = [0] + d4[:-1]
 
-        # 返回：4 条扫描顺序、对应的逆序（用于恢复 2D）、以及每个位置的方向编码。
-        return (tuple(o1), tuple(o2), tuple(o3), tuple(o4)), \
-            (tuple(o1_inverse), tuple(o2_inverse), tuple(o3_inverse), tuple(o4_inverse)), \
-            (tuple(d1), tuple(d2), tuple(d3), tuple(d4))
+        # 返回：n_dirs 条扫描顺序、对应的逆序（用于恢复 2D）、方向编码。
+        # n_dirs=4（默认）时与原返回完全一致。
+        return (tuple(o1), tuple(o2), tuple(o3), tuple(o4))[:n_dirs], \
+            (tuple(o1_inverse), tuple(o2_inverse),
+             tuple(o3_inverse), tuple(o4_inverse))[:n_dirs], \
+            (tuple(d1), tuple(d2), tuple(d3), tuple(d4))[:n_dirs]
 
     def _scan_params_for_order(self, order, dt, B, C, dB):
         if self.scan_param_order == 'aligned':
@@ -436,13 +455,14 @@ class SAVSS_2D(nn.Module):
 
         assert self.activation in ["silu", "swish"]
 
-        # 5) 生成 4 向扫描顺序与方向编码，并为每个方向构造 direction-aware 的 B 偏移。
-        orders, inverse_orders, directions = self.sass(hw_shape)
+        # 5) 生成扫描顺序与方向编码，并为每个方向构造 direction-aware 的 B 偏移。
+        #    扫描剪枝：只生成/遍历前 num_scans 条路径（默认 4 = 原 4 向）。
+        orders, inverse_orders, directions = self.sass(hw_shape, n_dirs=self.num_scans)
         direction_Bs = [self.direction_Bs[d, :] for d in directions]
         direction_Bs = [dB[None, :, :].expand(batch_size, -1, -1).permute(0, 2, 1).to(dtype=B.dtype) for dB in
                         direction_Bs]
 
-        # 6) 对 4 个方向分别调用 selective_scan_fn：
+        # 6) 对保留的 num_scans 个方向分别调用 selective_scan_fn：
         #    先按 order 重排 x → scan → 按 inv_order 逆序恢复 → 得到该方向的全局响应。
         #    数据依赖 lam 时，lam 与 x 一样按各方向的 order 重排后传入。
         scan_fn = self._get_scan_fn()

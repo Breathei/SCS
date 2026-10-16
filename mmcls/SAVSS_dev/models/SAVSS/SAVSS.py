@@ -77,6 +77,7 @@ class SAVSS(BaseBackbone):
                  asr_beta=0.1,
                  asr_route_grid=1,
                  asr_v2_beta=0.25,
+                 num_scans=4,
                  **kwargs):
         super(SAVSS, self).__init__(init_cfg)
 
@@ -94,6 +95,7 @@ class SAVSS(BaseBackbone):
         self.asr_beta = asr_beta
         self.asr_route_grid = asr_route_grid
         self.asr_v2_beta = asr_v2_beta
+        self.num_scans = num_scans
 
         if self.arch is None:
             self.embed_dims = embed_dims
@@ -172,6 +174,7 @@ class SAVSS(BaseBackbone):
                 _layer_cfg_i["mamba_cfg"]["asr_beta"] = self.asr_beta
                 _layer_cfg_i["mamba_cfg"]["asr_route_grid"] = self.asr_route_grid
                 _layer_cfg_i["mamba_cfg"]["asr_v2_beta"] = self.asr_v2_beta
+                _layer_cfg_i["mamba_cfg"]["num_scans"] = self.num_scans
             if i in self.layers_with_dwconv:
                 _layer_cfg_i.update({"with_dwconv": True})
             else:

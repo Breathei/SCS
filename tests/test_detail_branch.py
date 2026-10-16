@@ -1,7 +1,14 @@
 """高分辨率细节支路（detail branch）测试。
 
-默认关闭时行为与现状逐 bit 一致；开启 + 恒等/零初始化时初始前向与关闭
-完全一致（等价起点），detail 通路从零开始学习。
+最终形态（硬编码在 --detail_branch 开关内）：
+    delta  = Conv1x1(16→C, 权重偏置全零)(upsample(detail))
+    fused  = mfs_feat + delta
+    refine = PWConv1x1(C→C, 零初始化) ∘ DWConv3x3(C→C, groups=C)
+    fused  = fused + refine(fused)
+    随后接原有 dropout → linear_pred。
+
+默认关闭时行为与现状逐 bit 一致；开启 + 零初始化时初始前向与关闭完全
+一致（等价起点），detail 通路以残差修正方式从零开始学习。
 """
 import argparse
 import os
@@ -64,7 +71,7 @@ class TestDetailBranch(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), 'scan kernel 需要 CUDA')
     def test_on_zero_init_matches_off_forward(self):
-        # b) 开启 + 恒等/零初始化：首次前向输出 == 关闭时输出（容差 1e-6）。
+        # b) 开启 + 零初始化：首次前向输出 == 关闭时输出（容差 1e-6）。
         torch.manual_seed(0)
         model_off, _ = build_model(_ns(detail_branch=False))
         torch.manual_seed(0)
@@ -73,6 +80,11 @@ class TestDetailBranch(unittest.TestCase):
         off_sd, on_sd = model_off.state_dict(), model_on.state_dict()
         for k in off_sd:
             self.assertTrue(torch.equal(off_sd[k], on_sd[k]), k)
+        # delta 投影与 refine 输出层必须全零初始化（等价起点的硬要求）。
+        self.assertEqual(model_on.detail_delta.weight.abs().sum().item(), 0.0)
+        self.assertEqual(model_on.detail_delta.bias.abs().sum().item(), 0.0)
+        self.assertEqual(model_on.detail_refine_pw.weight.abs().sum().item(), 0.0)
+        self.assertEqual(model_on.detail_refine_pw.bias.abs().sum().item(), 0.0)
 
         model_off.eval().cuda()
         model_on.eval().cuda()
@@ -86,51 +98,73 @@ class TestDetailBranch(unittest.TestCase):
                         (y_on - y_off).abs().max().item())
 
     @unittest.skipUnless(torch.cuda.is_available(), 'scan kernel 需要 CUDA')
-    def test_on_forward_shape_and_finite_grads(self):
-        # c) 开启后输出 (B,1,512,512)，DetailBranch 与 backbone 梯度有限。
+    def test_on_forward_shape_and_two_step_grads(self):
+        # c) 输出 (B,1,512,512) 且梯度有限。
+        #    首 step：delta 投影与 refine_pw 获得非零梯度；DetailBranch 内部
+        #    与 refine_dw 被零权重隔离，允许接近零。第二 step 起必须非零。
         torch.manual_seed(0)
         model, _ = build_model(_ns(detail_branch=True))
         model.train().cuda()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         x = torch.randn(1, 3, 512, 512,
                         generator=torch.Generator().manual_seed(4)).cuda()
-        y = model(x)
-        self.assertEqual(y.shape, (1, 1, 512, 512))
-        self.assertTrue(torch.isfinite(y).all())
-        target = (torch.rand_like(y) > 0.97).float()
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(y, target)
-        loss.backward()
-        for name, p in model.named_parameters():
-            if p.grad is None:
-                continue
-            self.assertTrue(torch.isfinite(p.grad).all(), name)
-        self.assertIsNotNone(model.detail_branch.conv1.weight.grad)
-        self.assertIsNotNone(model.detail_fuse.weight.grad)
-        # detail 融合权重第一步即获得非零梯度。
-        self.assertGreater(model.detail_fuse.weight.grad.abs().sum().item(), 0.0)
+
+        def one_step():
+            optimizer.zero_grad()
+            y = model(x)
+            self.assertEqual(y.shape, (1, 1, 512, 512))
+            self.assertTrue(torch.isfinite(y).all())
+            target = (torch.rand_like(y) > 0.97).float()
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                y, target)
+            loss.backward()
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                self.assertTrue(torch.isfinite(p.grad).all(), name)
+            return loss
+
+        # step 0：零权重之后的层（delta、refine_pw）立即有非零梯度。
+        loss0 = one_step()
+        self.assertGreater(model.detail_delta.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(model.detail_refine_pw.weight.grad.abs().sum().item(), 0.0)
+        optimizer.step()
+
+        # step 1：零权重已离开 0，支路内部与 refine_dw 必须收到非零梯度。
+        loss1 = one_step()
+        self.assertGreater(model.detail_branch.conv1.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(model.detail_branch.conv2.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(model.detail_refine_dw.weight.grad.abs().sum().item(), 0.0)
         backbone_grads = [p.grad for n, p in model.backbone.named_parameters()
                           if p.grad is not None]
         self.assertTrue(any(g.abs().sum().item() > 0 for g in backbone_grads))
+        self.assertTrue(torch.isfinite(loss0) and torch.isfinite(loss1))
 
-    def test_param_overhead_below_10k(self):
-        # d) 支路新增参数量 < 10k，并打印完整对照。
+    def test_param_overhead_below_4000(self):
+        # d) 支路新增参数量 < 4000（C=8 时），并打印完整对照。
         torch.manual_seed(0)
         model_off, _ = build_model(_ns(detail_branch=False))
         torch.manual_seed(0)
         model_on, _ = build_model(_ns(detail_branch=True))
-        branch_params = (_num_params(model_on.detail_branch)
-                         + _num_params(model_on.detail_fuse))
+        parts = {
+            'DetailBranch': _num_params(model_on.detail_branch),
+            'detail_delta': _num_params(model_on.detail_delta),
+            'detail_refine_dw': _num_params(model_on.detail_refine_dw),
+            'detail_refine_pw': _num_params(model_on.detail_refine_pw),
+        }
+        branch_params = sum(parts.values())
         total_off = _num_params(model_off)
         total_on = _num_params(model_on)
-        print(f'DetailBranch params: {branch_params} '
-              f'(branch={_num_params(model_on.detail_branch)}, '
-              f'fuse={_num_params(model_on.detail_fuse)}); '
-              f'total off={total_off}, on={total_on}, '
-              f'delta={total_on - total_off}')
-        self.assertLess(branch_params, 10_000)
+        print('detail branch params: '
+              + ', '.join(f'{k}={v}' for k, v in parts.items())
+              + f'; total={branch_params}; '
+              + f'model off={total_off}, on={total_on}, '
+              + f'delta={total_on - total_off}')
+        self.assertLess(branch_params, 4000)
         self.assertEqual(total_on - total_off, branch_params)
 
     def test_cli_flag_propagates(self):
-        # e) --detail_branch 打开后模型确实包含 DetailBranch。
+        # e) --detail_branch 打开后模型确实包含 DetailBranch 及残差融合层。
         parser = argparse.ArgumentParser(parents=[get_args_parser()])
         args = parser.parse_args([])
         self.assertFalse(args.detail_branch)
@@ -140,7 +174,10 @@ class TestDetailBranch(unittest.TestCase):
         torch.manual_seed(0)
         model, _ = build_model(_ns(detail_branch=True))
         self.assertIsInstance(model.detail_branch, DetailBranch)
-        self.assertIsNotNone(model.detail_fuse)
+        self.assertIsNotNone(model.detail_delta)
+        self.assertIsNotNone(model.detail_refine_dw)
+        self.assertIsNotNone(model.detail_refine_pw)
+        self.assertEqual(model.detail_refine_dw.groups, model.mfs_channels)
 
     def test_legacy_checkpoint_strict_loads_default(self):
         # f) 旧 checkpoint（无支路）在默认配置下 strict-load 正常。
